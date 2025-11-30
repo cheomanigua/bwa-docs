@@ -1,0 +1,42 @@
+<nav>
+  <!-- Site Title (Brand) -->
+  {{ partial "docs/brand" . }}
+
+  <!-- Search Box -->
+  {{ partial "docs/search" . }}
+
+  <!-- Multilingual Support (optional) -->
+  {{ if hugo.IsMultilingual }}
+    {{ partial "docs/languages" . }}
+  {{ end }}
+
+  <!-- Render Menu Before Items -->
+  {{ partial "docs/menu-hugo" (dict "Page" .Page "Menu" .Site.Menus.before) }}
+
+  <!-- Only show pages under 'code' section, excluding _index.md -->
+  {{ $codePages := where .Site.Pages "Section" "code" }}
+  {{ $codePages := where $codePages "IsSection" false }}
+  {{ if gt (len $codePages) 0 }}
+    <ul class="code-menu">
+      {{ range $codePages }}
+        <!-- Ensure you're linking to individual diagram articles -->
+        <li>
+          <a href="{{ .Permalink }}">{{ .Title }}</a>
+        </li>
+      {{ end }}
+    </ul>
+  {{ end }}
+
+  <!-- Render Menu After Items -->
+  {{ partial "docs/menu-hugo" (dict "Page" .Page "Menu" .Site.Menus.after) }}
+
+  <!-- Inject any content after the menu -->
+  {{ partial "docs/inject/menu-after" . }}
+</nav>
+
+<!-- Add JS to Fix Menu Position -->
+{{ $script := resources.Get "menu-reset.js" | resources.Minify }}
+{{ with $script.Content }}
+  <script>{{ . | safeJS }}</script>
+{{ end }}
+
