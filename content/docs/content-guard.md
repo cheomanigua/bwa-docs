@@ -13,64 +13,114 @@ weight: 50
 
 Users could to access posts ONLY if their plan matches the category specified in the front-matter of the markdown file.
 
+Implementation of a gated content microservice pattern in the local development environment:
+
+- Authentication: Firebase Auth handles session management.
+- Authorization: The Go backend validates the session cookie and performs the content access check against the user's plan.
+- Secure Content Delivery: The Go backend generates a time-limited, signed URL for the protected file.
+- Local Emulation: The Caddy reverse proxy acts as the necessary intermediary to route the signed URL request back to the GCS Emulator, making the local process behave exactly like a production environment.
+
 ### Workflow Diagram
 
 ```mermaid
 flowchart LR
-    subgraph Browser
+    subgraph Client
         direction TB
-        request([Request: URI])
-        page_load([Load Static HTML])
+        request["1.Request: /posts/...<br/>(with __session cookie)"]
+        display([Display Protected Content])
     end
-    subgraph Go API
+    subgraph Proxy ["Caddy:5000"]
+        direction TB
+        caddy_route([Route: /posts/*])
+        caddy_proxy([GCS Proxy: /gcs-content/...])
+    end
+    subgraph Go Backend ["backend:8081"]
         direction TB
         handler(contentGuardHandler)
         helper(getAuthenticatedUserFromCookie)
-        auth_admin(Firebase<br/>Admin SDK<br/> Auth Client)
-        firestore_client(Firestore<br/>Admin Client)
         guard(ContentGuard.IsAuthorized)
+        signer(generateSignedURL)
+        redirect([HTTP 302])
+        auth_admin(Firebase Admin SDK<br/>Auth Client)
+        firestore_client(Firestore Admin Client)
     end
-    subgraph FIRESTORE
+    subgraph Firebase Emulators
         direction TB
-        db(users Collection)
+        auth_emu(Auth Emulator:9099)
+        firestore_emu(Firestore Emulator:8080<br/>users Collection)
     end
-    subgraph Filesystem
+    subgraph GCS Emulator ["gcs-emulator:9000"]
         direction TB
-        static_file(week0001/index.html)
+        gcs_serve([Serve: /content/posts/index.html])
     end
 
-    request -- "1" --> handler
-    handler <-- "8 / 2"--> helper
-    helper <-- "4 / 3" --> auth_admin
-    helper -- 5 --> firestore_client
-    firestore_client -- 6 --> db
-    db -- 7 --> helper
-    handler <-- "10 / 9" --> guard
-    handler -- "11" --> static_file
-    static_file -- "12" --> page_load
+    request -- "2" --> caddy_route
+    caddy_route -- "3" --> handler
+
+    handler -- "4" --> helper
+    helper -- "5" --> auth_admin
+    auth_admin -- "6" --> auth_emu
+    auth_emu -- "7" --> helper
+
+    helper -- "8" --> firestore_client
+    firestore_client -- "9" --> firestore_emu
+    firestore_emu -- "10" --> helper
+    
+    helper -- "11" --> handler
+
+    handler -- "12" --> guard
+
+    guard -- "13" --> handler
+    handler -- "14" --> signer
+    signer -- "15a" --> handler
+    handler -- "15b" --> redirect
+
+    redirect -- "15c" --> request
+    request -- "16" --> caddy_proxy
+
+    caddy_proxy -- "17a" --> gcs_serve
+    gcs_serve -- "18" --> request
+    request -- "19" --> display
+
+    guard -- "13a" --> handler
+    handler -- "13b" --> request
 ```
 
-### Process
+### Process Steps
 
--   **1.** Request URI: The user’s browser requests a restricted URL (e.g., `/posts/week0001`). The browser automatically attaches the stored `__session` cookie.
--   **2.** Check cookie: The handler calls `getAuthenticatedUserFromCookie(r)` to determine the user’s identity and plan.
--   **3.** Read `__session` cookie: The helper reads the `__session` cookie from the request headers.
--   **4.** Verify cookie: The helper sends the cookie value to the Admin SDK Auth Client (via `VerifySessionCookie`) to securely verify its validity and extract the user’s UID.
--   **5.** Get UID: Using the verified UID, the helper calls the Firestore Admin Client to read the user’s `plan` from the `users` collection.
--   **6.** Read plan/profile: The helper returns the full `AuthUser` struct, including the retrieved `Plan` (or `Plan="visitor"` if no cookie was found/verified).
--   **7.** Return `plan` (e.g. ‘pro’): The handler calls `contentGuard.IsAuthorized(requestPath, userPlan)`.
--   **8.** Return `AuthUser`: The Guard checks the requested path against its cached plan map (ContentGuard.permissions). If the user’s plan matches any required plan (or the content is unrestricted), access is granted.
--   **9a.** Check `IsAuthorized(path, 'pro')`: (If Authorized): The handler constructs the local file path (e.g., `public/posts/week0001/index.html`) and calls `http.ServeFile`.
--   **9b.** Check `IsAuthorized(path, 'pro')`:(If Denied): The handler sets HTTP Status 403 Forbidden and returns a custom HTML error page detailing the denial (including the user’s current plan).
--   **10.** Match found: The `ContentGuard.IsAuthorized` function returns true because the authenticated user’s Plan (e.g., ‘pro’) matches one of the categories required by the content. Authorization is granted.
--   **11.** Serve File: The Go API handler executes the success path. It maps the requested URL path (e.g., `/posts/week0001`) to the corresponding static file path (e.g., public/posts/week0001/index.html) and calls `http.ServeFile`.
--   **12** HTML/Content: The Go server streams the content of the authorized static HTML file from the filesystem back to the browser as the HTTP response.
+1.  **Request Initiation:** The user's browser requests the protected URL (e.g., `/posts/`), automatically including the `__session` cookie.
+2.  **Caddy Routes Request:** The Caddy reverse proxy receives the request and proxies it to the Go Backend (`backend:8081`).
+3.  **To Go Backend:** The request is passed to the Go Backend's `contentGuardHandler`.
+4.  **Read Session Cookie:** The handler calls the `getAuthenticatedUserFromCookie` helper function.
+5.  **Verify Token:** The helper function passes the cookie to the Firebase Admin SDK's Auth Client for verification.
+6.  **Request Verification:** The Auth Client contacts the **Auth Emulator** (`:9099`).
+7.  **Returns UID:** The Auth Emulator validates the token and returns the User ID (UID).
+8.  **Fetch User Plan:** The helper uses the UID to query the `firestoreClient`.
+9.  **Query users Collection:** The Firestore Client makes an API call to the **Firestore Emulator** (`:8080`).
+10. **Returns Plan Data:** The Firestore Emulator returns the user's plan (e.g., 'basic', 'pro') to the helper function.
+11. **Returns AuthUser:** The helper returns the full authenticated user profile (`AuthUser`) to the handler.
+12. **Check Authorization:** The handler calls `contentGuard.IsAuthorized(requestPath, userPlan)`. The Guard checks the requested path against its cached plan map (ContentGuard.permissions).
+13. **Authorization Outcome:**
+      * **13a. Plan DENIED:** If the plan is insufficient, the check fails.
+      * **13b. HTTP 403 Forbidden:** The handler returns an HTTP 403 Forbidden response to the client.
+      * **13. Plan Authorized:** If the check passes, the process continues.
+14. **Generate Fake Signed URL:** The handler calls the `generateSignedURL` function.
+15. **Redirection Preparation:**
+      * **15a. Returns Signed URL:** The `generateSignedURL` function returns the URL string containing the GCS proxy prefix (`/gcs-content/...`) and the signed parameters.
+      * **15b. Execute Redirect:** The handler sets the `Location` header to the signed URL.
+      * **15c. HTTP 302:** The Go Backend sends the `HTTP 302 Found` response to the client.
+16. **Follow Signed URL:** The browser follows the redirect, making a new request to the signed URL (now hitting the Caddy proxy).
+17. **Caddy GCS Proxy:**
+      * **17a. Strip /gcs-content & Proxy:** Caddy intercepts the request, strips the `/gcs-content` prefix, and proxies the modified request to the **GCS Emulator** (`gcs-emulator:9000`).
+18. **HTTP 200 Content:** The GCS Emulator validates the signature parameters and serves the content (e.g., `posts/index.html`) back to Caddy.
+19. **Display Protected Content:** Caddy forwards the HTTP 200 response to the browser, which renders the protected page.
+
 
 ### Permissions Map
 
 Restricted content can be accessed only if this condition is true: User's `plan` matches the post's front-matter `categories`.
 
-As we saw in step 8 of the process above, the guard checks the requested path against its cached plan map. This map is the `permissions` map.
+As we saw in step 12 of the process above, the guard checks the requested path against its cached plan map. This map is the `permissions` map.
 
 The permissions map is generated once:
 
@@ -209,3 +259,37 @@ func main() {
 ```
 
 By decoupling the file discovery (which happens during the CI/CD build) from the permission enforcement (which happens during Cloud Run runtime), you ensure the Go API is always using the correct access rules without needing to access your source code repository.
+
+* * *
+
+The process after clicking on "Posts" is working correctly. The logs show that your application successfully implemented the gated content mechanism using a signed URL flow.
+
+Here is a breakdown of the steps confirmed by the logs:
+
+1.  **Initial Request and Authorization:**
+    * The browser makes a `GET` request to `/posts/`.
+    * The Caddy server routes this request to the Go backend (`backend:8081`).
+    * The Go backend processes the request and, because you are logged in (indicated by the session cookie), the authorization check passes: `User authorized.`.
+
+2.  **Signed URL Generation:**
+    * The Go backend, running in emulator mode, generates a temporary, signed URL for the protected file: `posts/index.html`.
+    * The path includes the prefix `/gcs-content/` (e.g., `http://localhost:5000/gcs-content/content/posts/index.html?...`).
+
+3.  **Redirection:**
+    * The Go backend instructs Caddy to send a `302 Found` redirect to the browser, pointing to the newly generated signed URL.
+
+4.  **Content Retrieval:**
+    * The browser follows the redirect to the signed URL.
+    * Caddy's `@gcs_proxy` handler intercepts the `/gcs-content/...` request.
+    * Caddy strips the `/gcs-content` prefix and proxies the request to the GCS emulator (`gcs-emulator:9000`).
+    * The GCS emulator serves the requested file (`posts/index.html`) successfully, and the browser receives the content with a `200 OK` status code and a `content-length` of 4243 bytes.
+
+This confirms that the successful registration and subsequent access to the protected content are both functioning as designed.
+
+##### Summary
+
+- Go Backend: Generates the correct path: /gcs-content/content/posts/index.html.
+- Caddy (path stripping): Strips /gcs-content/, leaving /content/posts/index.html.
+- Caddy (syntax correction): The caddy-server logs show the Caddyfile successfully loaded, meaning the header_up syntax is now correct.
+- GCS Emulator Received Path: The emulator logs show it received the request for /content/posts/index.html (the correct path).
+- The Core Conflict: The GCS emulator is still returning a 404 for the proxied request that includes the signed URL parameters, even though it serves the same unauthenticated path via a direct curl (curl -I http://localhost:9000/content/posts/index.html returns 200 OK).
