@@ -11,6 +11,8 @@ weight: 40
 # bookIcon: ''
 ---
 
+# Authentication
+
 Authentication is the process of securely and effectively managing signups, logins, logouts and credentials storage.
 
 The current architecture implements a **Session Cookie-based authentication flow** that uses both the Firebase Client SDK (in the browser) and the Firebase Admin SDK (in your Go backend) for registration, login and logout. Firestore Admin Client (in your Go backend) is used for credential storage.
