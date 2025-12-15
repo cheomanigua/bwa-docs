@@ -10,11 +10,12 @@ TODO
 ```mermaid
 kanban
   Todo
-    [Require TOS on registration]
-    [Require Privacy Policy acceptance on registration]
+    [Registration: Require TOS]
+    [Registration: Require Privacy Policy acceptance]
     [Stripe Integration]
     [Email system]
-    [CLI for managing users]
+    [Admin's management CLI]
+    [User's management dashboard]
     [Polished UI & Design]
   [In progress]
     id6[Registration]

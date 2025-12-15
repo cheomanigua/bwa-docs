@@ -6,6 +6,29 @@ section = 'code'
 weight = 725
 +++
 
+# API
+
+```
+var (
+	// ... existing configuration ...
+
+	// Actual Key, Secret and IDs from Stripe Test Mode
+	StripeSecretKey = getEnv("TEST_SECRET_KEY", "sk_test_51MqjBWASlOB9XtLrMroE76gYUlZHh24ZBwB846GK6emMa9xYtmNaV9hC9GHVvOSEv1blS85wusuZN8EUQ7gk7MU400Vs1SWZ66")
+	StripeWebhookSecret = getEnv("TEST_WEBHOOK_SECRET", "whsec_411696825124da63c647bbb56b8584183a39c1a65345af1e9e71a0f3be41bb71")
+	StripePriceIDBasic = getEnv("TEST_PRICE_ID_BASIC", "price_1SeJiGASlOB9XtLr4Eh1sFKQ")
+	StripePriceIDPro = getEnv("TEST_PRICE_ID_PRO", "price_1SeJhZASlOB9XtLrwhqZJIOz")
+	StripePriceIDElite = getEnv("TEST_PRICE_ID_ELITE", "price_1SeJYfASlOB9XtLrAATjV41F")
+
+    // Frontend URL on Caddy container's port 5000
+	StripeSuccessURLBase = getEnv("TEST_SUCCESS_URL_BASE", "http://localhost:5000/success") 
+	StripeCancelURLBase  = getEnv("TEST_CANCEL_URL_BASE", "http://localhost:5000/cancel")
+)
+```
+
+> [!NOTE]
+> In order to obtain the [webhook signing secret](https://docs.stripe.com/webhooks) `TEST_WEBHOOK_SECRET` you have to run:
+> `stripe listen --forward-to localhost:8081/api/stripe/webhook`
+
 # General
 
 ### List customers
@@ -171,3 +194,21 @@ result, err := invoice.Del("invoicedid", params)
 ```
 {{% /tab %}}
 {{< /tabs >}}
+
+# Miscelanea
+
+> [!NOTE]
+> For listing/counting in live mode, add the `--live` flag after the `--limit 200` flag.
+
+### List all customers email addresses
+
+```
+stripe customers list --limit 200 | grep email | awk -F': "' '{print $2}' | sed 's/[",]//g'
+```
+
+### Count all customers email addresses
+
+```
+stripe customers list --limit 200 | grep email | awk -F': "' '{print $2}' | sed 's/[",]//g' | wc -l
+```
+
