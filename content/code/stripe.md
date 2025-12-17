@@ -6,7 +6,11 @@ section = 'code'
 weight = 725
 +++
 
-# API
+## Plans and Prices Creation
+
+Subscription plans and prices can be created in the Stripe dashboard.
+
+## Environment Variables
 
 ```
 var (
@@ -29,7 +33,174 @@ var (
 > In order to obtain the [webhook signing secret](https://docs.stripe.com/webhooks) `TEST_WEBHOOK_SECRET` you have to run:
 > `stripe listen --forward-to localhost:8081/api/stripe/webhook`
 
-# General
+## User Creation
+
+The example below create a user with a subscription:
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+
+	"github.com/stripe/stripe-go/v83"
+	"github.com/stripe/stripe-go/v83/customer"
+	"github.com/stripe/stripe-go/v83/paymentmethod"
+	"github.com/stripe/stripe-go/v83/subscription"
+)
+
+func main() {
+	// Set your Stripe secret key
+	stripe.Key = "sk_test_yourtestkey" // Replace with your actual test key
+
+	// Step 1: Create a new customer
+	customerParams := &stripe.CustomerParams{
+		Name:  stripe.String("John Doe"),
+		Email: stripe.String("johndoe@mail.com"),
+	}
+	newCustomer, err := customer.New(customerParams)
+	if err != nil {
+		log.Fatalf("Error creating customer: %v", err)
+	}
+
+	fmt.Printf("Step 1. Customer created with ID: %s\n", newCustomer.ID)
+
+	// Step 2: Attach a test payment method to the new customer
+	testPaymentMethodID := "pm_card_visa" // This is a test card provided by Stripe
+
+	attachParams := &stripe.PaymentMethodAttachParams{
+		Customer: stripe.String(newCustomer.ID), // Attach the payment method to the newly created customer
+	}
+
+	attachedPM, err := paymentmethod.Attach(testPaymentMethodID, attachParams)
+	if err != nil {
+		log.Fatalf("Error attaching payment method: %v", err)
+	}
+	fmt.Printf("Step 2a. Payment method %s successfully attached to customer\n", attachedPM.ID)
+
+	// Optionally: Set the attached payment method as the default for the customer
+	updateParams := &stripe.CustomerParams{
+		InvoiceSettings: &stripe.CustomerInvoiceSettingsParams{
+			DefaultPaymentMethod: stripe.String(attachedPM.ID),
+		},
+	}
+
+	_, err = customer.Update(newCustomer.ID, updateParams)
+	if err != nil {
+		log.Fatalf("Error updating customer with default payment method: %v", err)
+	}
+	fmt.Println("Step 2b. Default payment method set for customer")
+
+	// Step 3: Subscribe the customer to a plan (using a price ID)
+	subscriptionParams := &stripe.SubscriptionParams{
+		Customer: stripe.String(newCustomer.ID),
+		Items: []*stripe.SubscriptionItemsParams{
+			&stripe.SubscriptionItemsParams{
+				Price: stripe.String("price_yourpriceid"), // Replace with your actual Price ID
+			},
+		},
+	}
+
+	newSubscription, err := subscription.New(subscriptionParams)
+	if err != nil {
+		log.Fatalf("Error creating subscription: %v", err)
+	}
+	fmt.Printf("Step 3. Subscription created with ID: %s\n", newSubscription.ID)
+}
+```
+
+## User Management
+
+### Delete user
+
+{{< tabs >}}
+{{% tab "CLI" %}}
+
+```
+stripe customers list --email johndoe@mail.com | grep id
+"id": "cus_TbrQMZ2H4uWbe5"
+stripe subscriptions list --customer cus_TbrQMZ2H4uWbe5 | grep id
+"id": "sub_1SedhGASlOB9XtLrO9AtG8xF"
+stripe subscriptions cancel sub_1SedhGASlOB9XtLrO9AtG8xF
+stripe customers delete cus_TbrQMZ2H4uWbe5
+```
+
+{{% /tab %}}
+{{% tab "Go" %}}
+
+```go
+// Add the Stripe Client to your App struct
+type App struct {
+	// ... existing fields ...
+	StripeClient *stripe.Client // New field
+}
+
+// In NewApp:
+// app.StripeClient = stripe.NewClient(os.Getenv("STRIPE_SECRET_KEY"))
+
+func (a *App) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
+	user := a.getAuthenticatedUserFromCookie(r)
+	if user == nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// 1. Get stripeID from Firestore (assuming it's already loaded or fetched)
+    // NOTE: For full safety, you should re-fetch the user data from Firestore 
+    // to ensure you have the correct, current stripeID.
+	dsnap, err := a.FirestoreClient.Collection("users").Doc(user.UID).Get(r.Context())
+	if err != nil || !dsnap.Exists() {
+        // ... error handling
+	}
+    stripeID, _ := dsnap.Data()["stripeID"].(string)
+
+	if stripeID != "" {
+		// 2. Cancel active subscriptions (Optional but recommended before deletion)
+		subID, err := findActiveSubscriptionID(stripeID) // Using a helper function (defined above)
+		if err != nil {
+			log.Printf("Error checking subscriptions for %s: %v", stripeID, err)
+			// Continue to deletion, as this is non-critical for the delete operation
+		}
+		if subID != "" {
+			if err := cancelSubscription(subID); err != nil { // Using a helper function
+				log.Printf("Error canceling subscription %s: %v", subID, err)
+				// Continue to customer deletion
+			}
+		}
+
+		// 3. Delete Stripe Customer
+		if err := deleteStripeCustomer(stripeID); err != nil { // Using a helper function
+			log.Printf("Error deleting Stripe customer %s: %v", stripeID, err)
+			http.Error(w, "Failed to delete Stripe account, please try again.", http.StatusInternalServerError)
+			return
+		}
+	}
+	
+	// 4. Delete Firestore Doc
+	_, err = a.FirestoreClient.Collection("users").Doc(user.UID).Delete(r.Context())
+	if err != nil {
+		log.Printf("Error deleting Firestore user %s: %v", user.UID, err)
+		// NOTE: You might need manual cleanup if this fails, but continue to Firebase delete
+	}
+	
+	// 5. Delete Firebase User
+	if err := a.AuthClient.DeleteUser(r.Context(), user.UID); err != nil {
+		log.Printf("Error deleting Firebase user %s: %v", user.UID, err)
+		http.Error(w, "Account deleted from Stripe/Firestore but failed in Firebase.", http.StatusInternalServerError)
+		return
+	}
+	
+	// 6. Log out by clearing session cookie
+	http.SetCookie(w, &http.Cookie{Name: "__session", Value: "", MaxAge: -1, Path: "/"})
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Account successfully deleted."})
+}
+```
+
+{{% /tab %}}
+{{< /tabs >}}
 
 ### List customers
 
@@ -195,7 +366,7 @@ result, err := invoice.Del("invoicedid", params)
 {{% /tab %}}
 {{< /tabs >}}
 
-# Miscelanea
+## Miscelanea
 
 > [!NOTE]
 > For listing/counting in live mode, add the `--live` flag after the `--limit 200` flag.
@@ -206,9 +377,9 @@ result, err := invoice.Del("invoicedid", params)
 stripe customers list --limit 200 | grep email | awk -F': "' '{print $2}' | sed 's/[",]//g'
 ```
 
+
 ### Count all customers email addresses
 
 ```
 stripe customers list --limit 200 | grep email | awk -F': "' '{print $2}' | sed 's/[",]//g' | wc -l
 ```
-

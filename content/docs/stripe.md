@@ -13,6 +13,56 @@ weight: 60
 
 # Stripe Integration
 
+## Stripe Dashboard
+
+> [!NOTE]
+> You can limit to one subscription per customer in the Stripe Dashboard -> Settings -> Payments
+
+> [!NOTE]
+> You can set all options a customer can make in Customer Portal by editing Dashboard -> Settings -> Billing -> Customer Portal
+
+## API
+
+These are the main fields involved when developing the application:
+
+#### 1. Customers - [API](https://docs.stripe.com/api/customers)
+It is the user in the application. Main fields are:
+- id
+- name
+- email
+
+#### 2. Products - [API](https://docs.stripe.com/api/products)
+It is the plan name in the application. Main fields are:
+- id
+- default_price (Prices id)
+- name
+
+#### 3. Prices - [API](https://docs.stripe.com/api/prices)
+It is the price value in the application. Main fields are:
+- id
+- product (Products id)
+
+#### 4. Subscriptions - [API](https://docs.stripe.com/api/subscriptions) | [docs](https://docs.stripe.com/subscriptions)
+Subscriptions allow customers to make recurring payments for access to a product. It is the user's current recurring subscription in the application. For building the correct subscription integration, visit [here](https://docs.stripe.com/billing/subscriptions/design-an-integration#build-your-subscriptions-integration). Main fields are:
+- id
+- customer (Customers id)
+
+#### 5. Invoices - [API](https://docs.stripe.com/api/invoices)
+It is the monthly transaction in the application. Main fields are:
+- id
+
+## Concepts
+
+When creating a product in the Stripe dashboard, you are actually inputing:
+
+- Products:
+    - name
+- Prices:
+    - currency
+    - unit_amount
+    - type
+    - recurring/interval
+
 ## Summary
 
 The key challenge for your project is ensuring the Caddy proxy is configured to route all Stripe-related server calls to your Go backend, including the crucial asynchronous **Webhooks**.
@@ -61,18 +111,38 @@ This ensures `POST /webhooks/stripe` hits your Go service (`backend:8081`) and d
 
 You need to pass the Stripe keys to your Go backend container using environment variables in your `podman-compose.yml`.
 
-```yaml
-# podman-compose.yml snippet
-services:
-  backend:
-    image: your-go-backend-image
-    environment:
-      # Use the test secret key
-      - STRIPE_SECRET_KEY=sk_test_... 
-      # This is the signing secret from the Stripe CLI (see Phase 3)
-      - STRIPE_WEBHOOK_SECRET=whsec_... 
-    # ... rest of the backend config ...
+1. **.env**: Create the `.env` file in the root of your project with this content:
+    ```bash
+    STRIPE_SECRET_KEY="sk_test_yoursecretkeystring"
+    STRIPE_WEBHOOK_SECRET="whsec_yourwebhooksecretstring"
+    ```
+
+2. **compose.dev.yaml**: Edit the file and add the Stripe and Webhook secrets:
+
+    ```yaml
+    # podman-compose.yml snippet
+    services:
+      backend:
+        image: your-go-backend-image
+        environment:
+          # Use the test secret key
+          - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+          # This is the signing secret from the Stripe CLI (see Phase 3)
+          - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
+        # ... rest of the backend config ...
+    ```
+
+#### **C. Brigde Stripe with local containers**
+
+You have to bridge the gap between the live Stripe API and your application running on your local machine.
+
+```bash
+stripe listen --forward-to 127.0.0.1:8081/api/stripe-webhook
 ```
+You must use the new `whsec_...` secret it outputs to set the `StripeWebhookSecret` in your local Go environment before running your server. This is necessary for the integrity check performed by `webhook.ConstructEventWithOptions(...)`
+
+> [!WARNING]
+> Keep the bridge open, don't stop it with **Ctrl** + **C**. Open a new terminal to run your containers.
 
 -----
 
@@ -115,7 +185,7 @@ This code will be part of your `backend` service. When your frontend calls an AP
 Make sure your Go module is configured and you have the Stripe Go SDK installed.
 
 ```bash
-go get github.com/stripe/stripe-go/v78
+go get github.com/stripe/stripe-go/v84
 ```
 
 ### 2\. Go Handler: `CreateCheckoutSession`
@@ -130,8 +200,8 @@ import (
     "os"
     "log"
 
-    "github.com/stripe/stripe-go/v78"
-    "github.com/stripe/stripe-go/v78/checkout/session"
+    "github.com/stripe/stripe-go/v84"
+    "github.com/stripe/stripe-go/v84/checkout/session"
 )
 
 // Initialize Stripe with your Secret Key, typically done once at application startup.
@@ -214,8 +284,8 @@ import (
     "net/http"
     "os"
 
-    "github.com/stripe/stripe-go/v78"
-    "github.com/stripe/stripe-go/v78/webhook"
+    "github.com/stripe/stripe-go/v84"
+    "github.com/stripe/stripe-go/v84/webhook"
 )
 
 // StripeWebhookHandler processes incoming Stripe events.
@@ -300,7 +370,13 @@ To make both the Checkout Session and Webhook handlers work in your Caddy/Podman
     // ... rest of the 'route @backend' block ...
     ```
 
-2.  **Podman Environment:** Update your `podman-compose.yml` to pass the necessary keys to your `backend` container:
+2. **.env file**: Create the `.env` file in the root of your project with this content:
+    ```bash
+    STRIPE_SECRET_KEY="sk_test_yoursecretkeystring"
+    STRIPE_WEBHOOK_SECRET="whsec_yourwebhooksecretstring"
+    ```
+
+3.  **Podman Environment:** Update your `podman-compose.yml` to pass the necessary keys to your `backend` container:
 
     ```yaml
     # podman-compose.yml snippet
@@ -308,15 +384,56 @@ To make both the Checkout Session and Webhook handlers work in your Caddy/Podman
       backend:
         image: your-go-backend-image
         environment:
-          - STRIPE_SECRET_KEY=sk_test_... 
-          - STRIPE_WEBHOOK_SECRET=whsec_... # <-- CRITICAL FOR WEBHOOKS
+          - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+          - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
         # ...
     ```
 
-3.  **Local Testing (Stripe CLI):** Run the Stripe CLI to tunnel webhooks to your local Caddy endpoint, which will print the necessary `whsec_...` secret:
+4.  **Local Testing (Stripe CLI):** Run the Stripe CLI to tunnel webhooks to your local Caddy endpoint, which will print the necessary `whsec_...` secret:
 
     ```bash
     stripe listen --forward-to localhost:5000/webhooks/stripe
     ```
 
 You now have the full boilerplate for the client-side initiation (`CreateCheckoutSession`) and the server-side fulfillment (`StripeWebhookHandler`).
+
+## Testing
+
+1. In terminal A, run the `stripe listen` command for tunneling your localhost. Keep it running, don't stop it by pressing **Ctrl** + **C**:
+```
+stripe listen --forward-to 127.0.0.1:8081/api/stripe-webhook
+```
+2. Open terminal B and launch the containers.
+3. In a browser, go to `localhost:5000` and click on **Register** on any of the pricing cards.
+4. Fill out the Stripe form. When finished, you will be redirected to your account dashboard, but because you have not yet checked your "email address", you are redirected to login.
+5. In terminal B, check the Go API backend logs:
+```
+podman logs go-backend
+```
+You will get something like this:
+```
+2025/12/16 13:34:14 Initializing Content Guard...
+2025/12/16 13:34:14 ContentGuard: /posts/week0001 requires plans: [basic pro]
+2025/12/16 13:34:14 ContentGuard: /posts/week0002 requires plans: [basic]
+2025/12/16 13:34:14 ContentGuard: /posts/week0003 requires plans: [elite]
+2025/12/16 13:34:14 Starting Go server on :8081
+2025/12/16 13:35:35 Checkout session completed for Email: juan@mail.com, Plan: elite, Customer ID: cus_TcCpZkxD0hFQdr
+2025/12/16 13:35:35 Created new Firebase user with UID: XueVUBP6KfWp18UupZc2wS5BLSQY
+2025/12/16 13:35:36 SIMULATING SENDGRID: To johndoe@mail.com, Setup Link: http://127.0.0.1:9099/emulator/action?mode=resetPassword&lang=en&oobCode=lezz8pW7350dqq67PT-XZAKuMikvF6HfCEp7jXu8WM5TAxeZfwbYkr&apiKey=fake-api-key
+```
+The last logs line is what we are looking for. Now run these command:
+```
+curl "http://127.0.0.1:9099/emulator/action?mode=resetPassword&lang=en&oobCode=lezz8pW7350dqq67PT-XZAKuMikvF6HfCEp7jXu8WM5TAxeZfwbYkr&apiKey=fake-api-key&newPassword=fakepassword"
+```
+If everything goes well, you'll get:
+```
+{
+  "authEmulator": {
+    "success": "The password has been successfully updated.",
+    "email": "johndoe@mail.com"
+  }
+}
+```
+Basically we just copied the url of the last line Go API backend log file, added the suffix `&newPassword=fakepassword"` and wrap it in a `curl` command. The `fakepassword` is made up, you can type whatever.
+
+Now we can log in with `johndoe@mail.com` and `fakepassword`
