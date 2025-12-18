@@ -6,6 +6,8 @@ section = 'code'
 weight = 725
 +++
 
+# Stripe
+
 ## Plans and Prices Creation
 
 Subscription plans and prices can be created in the Stripe dashboard.

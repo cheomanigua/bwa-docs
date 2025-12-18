@@ -10,20 +10,33 @@ TODO
 ```mermaid
 kanban
   Todo
-    [Registration: Require TOS]
-    [Registration: Require Privacy Policy acceptance]
-    [Stripe Integration]
     [Email system]
     [Admin's management CLI]
-    [User's management dashboard]
     [Polished UI & Design]
+    [Forgot Password]
   [In progress]
-    id6[Registration]
-  id11[Done]
-    id5[Login]
-    id2[Logout]
-    id3[Gated Content]
+    [Registration]
+    [User's management dashboard]
+  [Done]
+    [Login]
+    [Logout]
+    [Gated Content]
+    [Stripe Integration]
 ```
+
+#### Work in Progress
+
+- Registration:
+    - Require TOS
+    - Require Privacy Policy acceptance
+- User's Management dashboard:
+    - Contact
+    - Change Password
+
+#### Doubts
+
+- Delete Stripe customer when users deletes account?
+- Better error handling on plan label update in users dashboard?
 
 ## - `main.go`
 
