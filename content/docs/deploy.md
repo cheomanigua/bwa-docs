@@ -18,6 +18,173 @@ You can selectively deploy different parts of your Hugo-generated site to **diff
 
 ---
 
+## 0. Manually
+
+In a production environment, you shift from using local scripts to using the **Google Cloud CLI (`gcloud`)** and your **Go backend** to handle the heavy lifting.
+
+To upload a new post from your computer and ensure it is protected by your "Content Guard," follow these steps:
+
+### 1. Upload the Content to GCS
+
+Instead of using a local emulator URL, you will use the `gsutil` command (part of the Google Cloud SDK) to push files to your production bucket.
+
+```bash
+# Upload the file
+gcloud storage cp ./index.html gs://your-production-bucket-name/posts/week0004/index.html
+
+```
+
+### 2. Set the Access Metadata
+
+This is the most critical step. In production, your Go API looks at the **GCS Custom Metadata** to decide who can see the file. You must tag the file with the required plan.
+
+```bash
+# Set metadata so only 'pro' and 'elite' users can see it
+gcloud storage objects update gs://your-production-bucket-name/posts/week0004/index.html \
+    --metadata=required-plans=pro
+
+```
+
+### 3. Verification Flow
+
+Once the file is in the bucket with the metadata:
+
+1. **Public User:** Tries to visit `yoursite.com/posts/week0004/`. Your Go API (Cloud Run) checks the GCS metadata, sees `pro` is required, and returns a **401 Unauthorized** or redirects to login.
+2. **Basic User:** Logs in. Go API sees they are `basic`, checks metadata (`pro`), and returns a **403 Forbidden**.
+3. **Pro/Elite User:** Logs in. Go API sees their plan satisfies the `pro` requirement and streams the file from GCS to their browser.
+
+---
+
+### Comparison: Local vs. Production
+
+| Feature | Local Emulator | Production |
+| --- | --- | --- |
+| **Storage** | GCS Emulator (Port 9000) | Google Cloud Storage Bucket |
+| **Logic** | Go API (Localhost) | Go API (Cloud Run) |
+| **Auth** | Firebase Auth Emulator | Firebase Auth (Live) |
+| **Upload Tool** | `curl` / `upload_posts.sh` | `gcloud storage` or CI/CD Pipeline |
+
+### Recommended: Automate with a "Publisher" Script
+
+In a real-world scenario, you shouldn't do this manually every time. You can create a simple `publish.sh` on your computer:
+
+```bash
+#!/bin/bash
+# Usage: ./publish.sh [folder_name] [required_plan]
+# Example: ./publish.sh week0004 pro
+
+FOLDER=$1
+PLAN=$2
+BUCKET="gs://your-production-bucket-name"
+
+echo "Publishing $FOLDER with plan $PLAN..."
+
+# 1. Upload
+gcloud storage cp -r ./$FOLDER "$BUCKET/posts/"
+
+# 2. Apply Metadata to all files in that folder
+gcloud storage objects update "$BUCKET/posts/$FOLDER/*" --metadata=required-plans=$PLAN
+
+echo "Done! Post is now live and protected."
+
+```
+
+Perfect. Since you are using the **TOML** format (the `+++` delimiters) and your plans are listed inside the `categories` array, we can make the GitHub Action even smarter.
+
+It will dynamically look at that `categories` list, find the "highest" plan mentioned, and use that to tag your files in Google Cloud Storage.
+
+### How the "Zero-Touch" Workflow looks now:
+
+1. **You edit:** `vi content/posts/week0004.md`
+2. **You set the category:** Just add `'basic'`, `'pro'`, or `'elite'` to that array.
+3. **You push:** `git push`
+4. **GitHub Action:**
+* Reads the `categories` line.
+* Finds the most restrictive plan (e.g., if both `basic` and `pro` are there, it chooses `pro`).
+* Builds the HTML with Hugo.
+* Uploads and tags the GCS object with `required-plans=pro`.
+
+
+
+### The Updated GitHub Action Logic
+
+We will use a **service account key** stored as a "Secret" in GitHub. This is the simplest way to give the GitHub Action permission to manage your GCS bucket without manual setup on your machine.
+
+Here is the specific part of the script that handles your `+++` front matter dynamically. It uses a bit of "text magic" (`sed` and `awk`) to grab the categories without needing any extra tools.
+
+Create `.github/workflows/deploy.yml` in your repository. This script handles the Hugo build, extracts the plan from your `+++` front matter, and updates Google Cloud.
+
+```yaml
+name: Deploy Protected Posts
+on:
+  push:
+    paths:
+      - 'content/posts/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Hugo
+        uses: peaceiris/actions-hugo@v2
+
+      - name: Build Site
+        run: hugo --minify
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}' # This is the "Key" we will add to GitHub
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Detect and Deploy
+        run: |
+          # 1. Identify which Markdown file changed
+          CHANGED_FILES=$(git diff --name-only HEAD^ HEAD | grep '^content/posts/')
+
+          for file in $CHANGED_FILES; do
+            slug=$(basename "$file" .md)
+            
+            # 2. Extract the 'categories' array from your +++ front matter
+            # This logic looks for the highest tier in your list
+            CATEGORIES=$(grep "categories =" "$file")
+            
+            if [[ $CATEGORIES == *"elite"* ]]; then
+              PLAN="elite"
+            elif [[ $CATEGORIES == *"pro"* ]]; then
+              PLAN="pro"
+            elif [[ $CATEGORIES == *"basic"* ]]; then
+              PLAN="basic"
+            else
+              PLAN="free"
+            fi
+
+            echo "🚀 Deploying $slug with Plan: $PLAN"
+
+            # 3. Upload the generated HTML folder to your Production Bucket
+            gcloud storage cp -r "public/posts/$slug" gs://your-production-bucket/posts/
+
+            # 4. Apply the Metadata tag so your Go API can protect it
+            gcloud storage objects update "gs://your-production-bucket/posts/$slug/**" \
+              --metadata=required-plans=$PLAN
+          done
+```
+
+### Why this works for you:
+
+* **Matches your format:** It specifically looks for the `categories = [...]` line you already use.
+* **Smart Selection:** If you have `categories = ['basic', 'pro']`, the script is smart enough to see `pro` and set the security to that level.
+* **No new files:** You don't have to change how you use Hugo at all.
+
+---
+
 ## 1. Your Workflow Concept
 
 1. **Author writes posts locally using Hugo**

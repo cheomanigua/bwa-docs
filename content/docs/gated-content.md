@@ -26,7 +26,7 @@ Due to Firebase Hosting being the router, the most secure way to deliver the res
 1. Streaming the file directly from the Go Backend.
 2. Generating a short time-limited **Signed URL** for content delivery.
 
-On both cases, restricted pages (files) are stored in GCS.
+On both cases, restricted pages (files) are stored in GCS (Google Cloud Storage).
 
 * * *
 
@@ -36,26 +36,30 @@ In this scenario, the Go backend reads the file directly from GCS using the SDK 
 
 Direct Streaming via SDK: the wording reflects that the backend is no longer just a gatekeeper but the actual delivery vehicle for the content. Instead of delegating the final fetch to the client and storage provider, the backend takes full ownership of the data stream.
 
-
 #### 1. Delegation of Responsibility
 
 This architecture improves security and efficiency by clearly separating concerns across components:
 
-| Component              | Primary Responsibility        | Key Feature                                                                                                            |
-| :--------------------- | :---------------------------- | :--------------------------------------------------------------------------------------------------------------------- |
-| **Go Backend**         | Authorization & Data Streaming | Validates users, checks `ContentGuard` permissions, and actively fetches/pipes bytes from storage to the client.             |
-| **Caddy Proxy**        | Entry Point Routing    | Acts as the primary ingress, forwarding external requests to the Go Backend while maintaining a single domain for the user.  |
-| **GCS Emulator / GCS** | Internal Storage Provider              | Acts as a private data source that only responds to internal backend requests, keeping the raw storage layer hidden from the public. |
+| Component | Primary Responsibility | Key Feature |
+| :--- | :--- | :--- |
+| **Go Backend** | Authentication, Authz & Proxying | Verifies sessions via Firebase, evaluates the plan hierarchy, and streams gated content from GCS. |
+| **Caddy Proxy** | Unified Entry Point | Forwards external requests to the Go Backend while ensuring a single-domain experience for the user. |
+| **GCS Emulator** | Gated Metadata & Storage | Stores raw HTML posts and custom `required-plans` metadata, accessible only by internal backend requests. |
+| **Firebase Emulators** | Identity & Profile Provider | Handles session validation (Auth) and stores user subscription levels (Firestore) for real-time lookups. |
 
+#### 2. Pattern Implementation
 
 Implementation of a gated content microservice pattern in the local development environment:
 
-- **Authentication**: Firebase Auth manages secure session state via cookies.
-- **Authorization**: The Go backend validates the session cookie and performs a real-time access check against the user’s subscription plan (e.g., Basic, Pro, Elite).
-- **Secure Content Delivery**: The Go backend initiates an internal request to GCS and streams the response directly to the user. This ensures the storage URL is never exposed and content can be protected with `Cache-Control: no-store`.
-- **Local Emulation**:
-    - **Go Backend as proxy**: Bypasses complex signing logic by using a direct REST API call (`alt=media`) to the emulator to retrieve raw file bytes.
-    - **GCS Emulator**: Serves as the internal object store, mapping local directories to virtual buckets for the backend to consume.
+- **Authentication**: Firebase Auth manages secure session state via `__session` cookies. The Go backend leverages the Firebase Admin SDK to verify these tokens against the local Auth Emulator.
+- **Authorization & Metadata**: The Go backend performs a real-time dual-check:
+    1. It fetches the user's `plan` from Firestore.
+    2. It fetches the object's `required-plans` from GCS metadata.
+    3. It evaluates access using a defined hierarchy (`visitor` < `basic` < `pro` < `elite`).
+- **Secure Content Delivery**: Content is never served directly from the public web. The Go backend acts as a **Secure Proxy**, initiating an internal REST request to GCS and streaming the binary data using `io.Copy`. This ensures GCS credentials and URLs are never exposed to the client.
+- **Local Emulation Strategy**:
+    - **Go Backend as Proxy**: Bypasses complex cloud signing logic by using a direct REST API call (`alt=media`) to the GCS emulator to retrieve raw file bytes.
+    - **Metadata-Driven Guard**: Uses GCS custom metadata fields to store access rules, allowing content to be "gated" simply by tagging the file during the upload process (e.g., via the `uploader.go` script).
 
 #### 2. Server Configuration
 
@@ -89,8 +93,9 @@ Ensure the rewrite rules point to the backend for the `/posts/` path.
 flowchart LR
     subgraph Client
         direction TB
-        request["1. Request: /posts/...<br/>(with __session cookie)"]
+        request["Request: /posts/...<br/>(with __session cookie)"]
         display([Display Protected Content])
+        forbidden([403 Forbidden Response])
     end
 
     subgraph Caddy ["Caddy:5000"]
@@ -102,7 +107,7 @@ flowchart LR
         direction TB
         handler(handleContentGuard)
         helper(getAuthenticatedUserFromCookie)
-        guard(ContentGuard.IsAuthorized)
+        guard(isAuthorized)
         http_fetch(Standard http.Get)
         auth_admin(Firebase Admin SDK<br/>Auth Client)
         firestore_client(Firestore Admin Client)
@@ -116,59 +121,69 @@ flowchart LR
 
     subgraph GCS_Emulator ["gcs-emulator:9000"]
         direction TB
-        gcs_api([REST API: /storage/v1/b/...<br/>alt=media])
+        gcs_api([GCS REST API])
     end
 
-    request -- "2" --> caddy_route
-    caddy_route -- "3" --> handler
+    request -- 1 --> caddy_route
+    caddy_route -- 2 --> handler
 
-    handler -- "4" --> helper
-    helper -- "5" --> auth_admin
-    auth_admin -- "6" --> auth_emu
-    auth_emu -- "7" --> helper
+    %% Authentication & Authorization
+    handler -- 3 --> helper
+    helper -- 4 --> auth_admin
+    auth_admin -- 5 --> auth_emu
+    auth_emu -- 6 --> auth_admin
+    auth_admin -- 7 --> firestore_client
+    firestore_client -- 8 --> firestore_emu
+    firestore_emu -- 9 --> firestore_client
+    firestore_client -- 10 --> helper
+    helper -- 11 --> handler
 
-    helper -- "8" --> firestore_client
-    firestore_client -- "9" --> firestore_emu
-    firestore_emu -- "10" --> helper
-    
-    helper -- "11" --> handler
+    %% Metadata & Logic
+    handler -- 12 --> gcs_api
+    gcs_api -- 13 --> handler
+    handler -- 14 --> guard
 
-    handler -- "12" --> guard
-    guard -- "13" --> handler
+    %% Branching
+    guard -- 15a --> forbidden
+    guard -- 15b --> http_fetch
 
-    handler -- "14" --> http_fetch
-    http_fetch -- "15" --> gcs_api
-    gcs_api -- "16" --> http_fetch
-    http_fetch -- "17" --> handler
-    handler -- "18" --> display
+    %% Fetch & Stream
+    http_fetch -- 16 --> gcs_api
+    gcs_api -- 17 --> http_fetch
+    http_fetch -- 18 --> handler
+    handler -- 19 --> display
 ```
 
 #### 4. Process Steps
 
-1. **Request Initiation**: The browser requests a protected URL (e.g., `/posts/week0003/`), sending the `__session` cookie.
-2. **Caddy Routes Request**: The Caddy proxy receives the traffic and forwards it to the Go Backend on port `:8081`.
-3. **Handler Invocation**: The Go Backend receives the request in `handleContentGuard`.
-4. **Read Session Cookie**: The handler calls `getAuthenticatedUserFromCookie` to identify the user.
-5. **Verify Token**: The helper uses the Firebase Admin SDK to verify the session cookie.
-6. **Auth Emulator Check**: The Firebase Auth Emulator validates the session.
-7. **UID Returned**: The unique User ID is returned to the helper function.
-8. **Fetch User Profile**: The helper queries Firestore to retrieve the user's subscription plan.
-9. **Firestore Emulator Lookup**: The Firestore Emulator returns the plan level (e.g., `elite`).
-10. **Return AuthUser**: The helper returns the full `AuthUser` profile to the handler.
-11. **Authorization Check**: The handler invokes contentGuard.IsAuthorized to check if the user's plan permits access to the specific permPath.
-12. **Authorization Outcome**:
-     - **Denied**: The handler returns a `403 Forbidden` status with an HTML error message.
-     - **Authorized**: The process continues to the fetch stage.
-13. **Path Construction**: The handler sanitizes the request path and ensures it targets `index.html` for directory requests.
-14. **Direct API Fetch**: The handler bypasses the SDK and initiates a standard `http.Get` request to the GCS Emulator's REST API.
-15. **Media Request**: The request hits `gcs-emulator:9000` using the `alt=media` parameter and a URL-encoded object path to retrieve raw file bytes.
-16. **GCS Serves Content**: The GCS Emulator locates the file (e.g., `/data/content/posts/week0003/index.html`) and returns the binary data.
-17. **Stream to Backend**: The Go Backend receives the data stream and sets the appropriate `Content-Type` and `Cache-Control: no-store` headers.
-18. **Direct Stream to Client**: Using `io.Copy`, the backend pipes the bytes directly to the browser's response, completing the proxy flow.
+1.  **Request Initiation**: The browser requests a protected URL (e.g., `/posts/week0005/`), automatically sending the `__session` cookie.
+2.  **Caddy Routing**: The Caddy proxy forwards the request to the Go Backend's `handleContentGuard` handler on port `:8081`.
+3.  **Authentication Start**: The handler calls `getAuthenticatedUserFromCookie` to identify the requester and their plan.
+4.  **SDK Invocation**: The helper uses the Firebase Admin SDK `authClient` to begin the verification process.
+5.  **Token Verification**: The SDK sends the session cookie to the **Auth Emulator (:9099)** to validate the token.
+6.  **UID Retrieval**: The Auth Emulator validates the session and returns the unique User ID (UID) and claims.
+7.  **Database Request**: The helper then uses the **Firestore Admin Client** to look up the user's profile.
+8.  **Profile Lookup**: The client queries the **Firestore Emulator (:8080)** using the verified UID.
+9.  **Plan Retrieval**: The Firestore Emulator returns the user's document containing their subscription level (e.g., `pro`).
+10. **Helper Completion**: The Firestore client returns the retrieved plan data back to the `getAuthenticatedUserFromCookie` function.
+11. **Return User Profile**: The helper returns the full `AuthUser` profile (UID, Email, Plan) back to the `handleContentGuard` handler.
+12. **Metadata Fetch**: The handler calls `getRequiredPlans`, which performs an `Attrs` request to the **GCS Emulator (:9000)**.
+13. **Requirements Retrieval**: The GCS Emulator returns the object's custom metadata, specifically the `required-plans` values.
+14. **Authorization Logic**: The handler invokes `isAuthorized` to compare the user's plan level against the object's requirements.
+15. **Authorization Outcome**:
+    * **15a (Denied)**: If the user fails the check, the handler returns a `403 Forbidden` status and an error page.
+    * **15b (Authorized)**: If the user is authorized, the process continues to content retrieval.
+16. **Media Request**: The handler initiates a standard `http.Get` request with `alt=media` to the **GCS Emulator**.
+17. **Content Delivery**: The GCS Emulator streams the raw HTML binary data of the post back to the backend.
+18. **Data Reception**: The Go Backend receives the binary data stream and sets the correct `Content-Type` header.
+19. **Direct Stream to Client**: The backend uses `io.Copy` to pipe the HTML bytes directly to the browser response, completing the proxy flow.
 
 ---
 
 ## Scenario 2: Signed URL Redirect
+
+> [!DANGER]
+> The documentation for Scenario 2: Signed URL Redirect is currently in design stage. It can be incorrect.
 
 In this scenario, the Go backend generates a temporary link and instructs the browser to fetch the file directly from GCS via an HTTP 302 redirect.
 
@@ -236,10 +251,10 @@ Ensure the rewrite rules point to the backend for the `/posts/` path.
 flowchart LR
     subgraph Client
         direction TB
-        request["1. Request: /posts/...<br/>(with __session cookie)"]
-        redirect["16. 302 Redirect to Signed URL"]
-        fetch_direct["17. GET Signed URL"]
-        display([19. Display Protected Content])
+        request["1\. Request: /posts/...<br/>(with __session cookie)"]
+        redirect["302 Redirect to Signed URL"]
+        fetch_direct["GET Signed URL"]
+        display([Display Protected Content])
     end
 
     subgraph Caddy ["Caddy:5000"]
@@ -319,101 +334,85 @@ flowchart LR
 
 ## Scenario 1 vs Scenario 2
 
-Here is the comprehensive documentation table for both scenarios, distinguishing between your local development setup (**Caddy**) and your production environment (**Firebase Hosting**).
+This documentation distinguishes between your current **Direct Stream** architecture and the alternative **Signed URL** approach, mapping them to your specific local development setup (**Caddy + Go**) and production environment (**Firebase + GCS**).
 
-| Feature | Scenario 1 (Direct Stream) | Scenario 2 (302 Redirect) |
-| --- | --- | --- |
-| **Go Code** | `io.Copy(w, gcsReader)` | `http.Redirect(w, r, signedURL, 302)` |
-| **Caddy** | Simple Proxy: Forwards requests to Go. | Request Router: Routes to Go, then to GCS Emulator. |
-| **Firebase Hosting** | Rewrite Engine: Proxies requests to Go | Edge Router: Proxies to Go, then permits GCS redirect. |
-| **User Hops** | 1 (Fastest) Browser ↔ Backend. | 2 (Browser follows redirect) Browser → Backend → GCS. |
-| **Security** | Maximum: GCS fully hidden from user. | Balanced: GCS URL briefly exposed to browser |
-| **Performance** | Higher Backend CPU/Bandwidth usage. | Highly Scalable (Offloads bandwidth to GCS). |
+| Feature | Your Current Process (Direct Stream) | Alternative (302 Redirect) |
+| :--- | :--- | :--- |
+| **Go Code** | `io.Copy(w, resp.Body)` (via `http.Get`) | `http.Redirect(w, r, signedURL, 302)` |
+| **Caddy** | **Simple Proxy**: Forwards `/posts/*` directly to Go. | **Request Router**: Forwards to Go, then routes browser to GCS. |
+| **Firebase Hosting** | **Rewrite Engine**: Proxies request to Backend Function. | **Edge Router**: Proxies to Go, then permits GCS redirect. |
+| **User Hops** | **1 (Fastest)**: Browser ↔ Go Backend. | **2**: Browser → Go Backend → GCS. |
+| **Security** | **Maximum**: GCS/Bucket paths are fully hidden from user. | **Balanced**: GCS bucket URL is briefly exposed to browser. |
+| **Performance** | Higher Backend Bandwidth (Backend pipes all data). | **Highly Scalable**: Offloads bandwidth to Google’s Edge. |
 
+* * *
 
 ### Component Roles & Terminology
 
-| Component | Scenario 1: Direct Streaming | Scenario 2: Signed URL Redirect |
-| --- | --- | --- |
-| **Go Backend** | **Content Proxy:** Authenticates user and pipes file bytes from storage to client. | **Authorization Server:** Authenticates user and issues a temporary "pass" (Signed URL). |
-| **Local Proxy** (Caddy) | **Simple Proxy:** Forwards requests to the Go backend. | **Request Router:** Directs the initial auth request to Go, then routes the redirect to the GCS Emulator. |
-| **Prod Hosting** (Firebase) | **Rewrite Engine:** Uses `firebase.json` to trigger the Cloud Function/Backend. | **Edge Router:** Rewrites to the backend for auth, then allows the browser to jump to a GCS domain. |
-| **Storage** (GCS) | **Private Origin:** Hidden from the public; only talks to the Go Backend. | **Resource Server:** Serves content directly to the browser after validating the signature. |
+| Component | Your Process: Direct Streaming | Alternative: Signed URL Redirect |
+| :--- | :--- | :--- |
+| **Go Backend** | **Secure Proxy**: Authenticates user and actively pipes bytes from storage to client. | **Authorization Server**: Authenticates user and issues a temporary "pass" (Signed URL). |
+| **Local Proxy** (Caddy) | **Ingress**: Forwards inbound traffic directly to the Go backend port `:8081`. | **Request Router**: Directs auth request to Go, then routes redirect to GCS Emulator. |
+| **Prod Hosting** (Firebase) | **Rewrite Engine**: Uses `firebase.json` to trigger the Backend Function while keeping user on same URL. | **Edge Router**: Rewrites to backend for auth, then allows browser to jump to GCS domain. |
+| **Storage** (GCS) | **Private Origin**: Hidden from public; only responds to internal backend requests. | **Resource Server**: Serves content directly to browser after validating URL signature. |
 
----
+* * *
 
 ### Implementation Details by Environment
 
 #### **Scenario 1: Direct Streaming (The "Hidden" Pattern)**
+*This is the current implementation used in `main.go` to enforce Gated Content.*
 
-In this model, the user stays on your domain, and your backend handles the data.
+In this model, the user stays on your domain, and your Go backend acts as a secure proxy to fetch and pipe the data.
 
 | Feature | Local Dev (Caddy + Emulator) | Production (Firebase + GCS) |
-| --- | --- | --- |
-| **Routing** | Caddy `reverse_proxy` to `:8081`. | `firebase.json` **Rewrite** to Function. |
-| **Data Flow** | GCS Emulator  Go  Caddy  User. | GCS  Go  Firebase Hosting  User. |
-| **Configuration** | `Caddyfile`: `reverse_proxy /posts/* backend:8081` | `firebase.json`: `{"source": "/posts/**", "function": "..."}` |
+| :--- | :--- | :--- |
+| **Routing** | Caddy `reverse_proxy` to port `:8081`. | `firebase.json` **Rewrite** to Backend Function. |
+| **Data Flow** | GCS Emulator → Go Backend → Caddy → User. | GCS → Go Backend → Firebase Hosting → User. |
+| **Configuration** | `Caddyfile`: `reverse_proxy /posts/* backend:8081` | `firebase.json`: `{"source": "/posts/**", "function": "app"}` |
+| **Mechanism** | Standard `http.Get` via REST API (`alt=media`). | GCS SDK `NewReader` or internal API call. |
 | **Security** | Internal network fetch (No Signatures). | IAM-based internal fetch (No public URLs). |
+| **Path Logic** | **Sanitization**: Automatically appends `index.html` to directory requests. | **Sanitization**: Maps URL paths to GCS Object Keys. |
+| **Caching** | **`Cache-Control: no-store`** enforced for gated items. | Managed via Backend response headers. |
+
+
 
 #### **Scenario 2: Signed URL Redirect (The "Scalable" Pattern)**
+*This is the alternative model for offloading high-bandwidth delivery to Google's infrastructure.*
 
-In this model, the user is temporarily sent to the storage provider to download the file.
+In this model, the user is temporarily redirected (302) to the storage provider after the backend validates their subscription.
 
 | Feature | Local Dev (Caddy + Emulator) | Production (Firebase + GCS) |
-| --- | --- | --- |
-| **Routing** | Caddy routes to Go, then to Emulator. | Firebase rewrites to Go, then redirects to GCS. |
-| **Data Flow** | Go sends 302  User fetches from Emulator. | Go sends 302  User fetches from GCS. |
-| **Configuration** | `generateSignedURL` uses Emulator URL. | `generateSignedURL` uses `storage.googleapis.com`. |
-| **Security** | Manual/Fake signatures for local testing. | Cryptographic V4 signatures with expiration. |
-
----
+| :--- | :--- | :--- |
+| **Routing** | Caddy routes to Go, then to Emulator port. | Firebase rewrites to Go, then redirects to GCS. |
+| **Data Flow** | Go sends 302 → User fetches from Emulator. | Go sends 302 → User fetches from GCS. |
+| **Configuration** | `generateSignedURL` uses Emulator Host/Port. | `generateSignedURL` uses `storage.googleapis.com`. |
+| **Mechanism** | `http.Redirect` to unsigned/fake-signed URL. | `http.Redirect` to cryptographic V4 Signed URL. |
+| **Security** | Manual testing (Signatures bypassed/faked). | Cryptographic RSA signatures with expiration. |
 
 * * *
 
-### Delegation of Responsibility: Scenario Comparison
+### Technical Nuances of Our Process
 
-This table outlines how each component functions in the two architectural patterns.
+- **Authentication**: Firebase Auth manages secure session state via `__session` cookies. The Go backend validates the session cookie and performs a real-time access check against the user’s subscription plan (e.g., Basic, Pro, Elite) stored in Firestore.
+- **Path Construction**: Our handler cleans the URL path and appends `index.html` for directory requests. This ensures that Hugo-generated "Pretty URLs" (e.g., `/posts/week0005/`) correctly resolve to the storage object (`posts/week0005/index.html`).
+- **Secure Content Delivery**: By initiating an internal request to GCS and streaming the response, we ensure the storage bucket URL and internal naming conventions are never exposed to the public. This also allows us to dynamically set MIME types and security headers.
+- **Local Emulation Strategy**:
+    - **Go Backend as Proxy**: To simplify local development, the backend bypasses complex cloud signing logic by using a direct REST API call (`alt=media`) to the GCS emulator to retrieve raw file bytes.
+    - **GCS Emulator**: Serves as the internal object store, mapping local directories to virtual buckets for the backend to consume via localhost ports.
 
-| Component | Scenario 1: Direct Streaming | Scenario 2: Signed URL Redirect |
-| --- | --- | --- |
-| **Go Backend** | **Content Proxy**: Authenticates the user and actively pipes file bytes from storage to the client response. | **Authorization Server**: Authenticates the user and issues a temporary cryptographic "pass" (Signed URL). |
-| **Local Proxy (Caddy)** | **Simple Proxy**: Forwards inbound traffic directly to the Go backend port. | **Request Router**: Routes the initial request to Go, then routes the subsequent browser redirect to the GCS Emulator. |
-| **Prod Hosting (Firebase)** | **Rewrite Engine**: Uses `firebase.json` to trigger the backend while keeping the user on the same URL. | **Edge Router**: Rewrites to the backend for authorization, then permits the browser to redirect to the GCS domain. |
-| **Storage (GCS)** | **Private Origin**: Remains hidden from the public; only communicates with the Go Backend internally. | **Resource Server**: Serves content directly to the browser after validating the URL signature and expiration. |
-
----
-
-### Implementation by Environment
-
-#### **Scenario 1: Direct Streaming (The "Hidden Proxy" Pattern)**
-
-This model is prioritized for **Security**. The user never leaves your domain, and the raw storage location is never exposed to the public internet.
-
-| Feature | Local Development (Caddy + Emulator) | Production (Firebase + GCS) |
-| --- | --- | --- |
-| **Primary Mechanism** | Caddy `reverse_proxy` | Firebase Hosting `rewrites` |
-| **Logic** | `io.Copy(w, resp.Body)` from Emulator. | `io.Copy(w, gcsReader)` from GCS Bucket. |
-| **Routing Config** | `reverse_proxy /posts/* backend:8081` | `{"source": "/posts/**", "function": "app"}` |
-| **Storage Access** | Internal network (Direct API call). | IAM-based Service Account (Internal). |
-
-#### **Scenario 2: Signed URL Redirect (The "Scalable" Pattern)**
-
-This model is prioritized for **Performance**. It offloads the bandwidth costs and memory usage of file delivery to Google's global infrastructure.
-
-| Feature | Local Development (Caddy + Emulator) | Production (Firebase + GCS) |
-| --- | --- | --- |
-| **Primary Mechanism** | Caddy routing + 302 Redirect | Firebase Rewrites + 302 Redirect |
-| **Logic** | `http.Redirect` to Local Emulator URL. | `http.Redirect` to `storage.googleapis.com`. |
-| **Signature** | Manual "Fake" signature for local test. | Cryptographic RSA/V4 Signature. |
-| **User Experience** | Browser follows redirect to local port. | Browser follows redirect to GCS domain. |
-
----
+* * *
 
 ### Documentation Summary
 
-* **For Scenario 1:** Emphasize **Control**. The Go Backend is a **Proxy** and also a **Streaming Gateway**. The local configuration is a **Simple Proxy**, and the production configuration is a **Rewrite**.
+* **Your Chosen Pattern (Direct Streaming):** Emphasizes **Total Control**. Your Go Backend acts as a **Streaming Gateway**. The local configuration is a simple passthrough, and the user never knows GCS exists. This is ideal for your "Gated Content" model because it prevents users from sharing URLs to bypass the subscription check.
+  
+* **The Scalable Alternative (Signed URLs):** Emphasizes **Resource Efficiency**. The Go Backend is a **Gatekeeper**. You would only switch to this if your traffic grew so large that the Go Backend could no longer handle the bandwidth of "piping" the HTML files to thousands of concurrent users.
 
-* **For Scenario 2:** Emphasize **Efficiency**. The Go Backend is a **Gatekeeper** and also a **Token Issuer**. The local configuration is a **Request Router**, and the production configuration is an **Edge Redirect**.
+**Why Scenario 1 is best for your current Project:**
+1.  **Strict Gating**: Since you check the subscription level in real-time before fetching the bytes, Direct Streaming ensures no one can "sniff" a GCS link and share it.
+2.  **Ease of Testing**: Using `http.Get` against the GCS Emulator is much simpler than generating local cryptographic signatures.
+3.  **SEO/UX**: Users always stay on `yourdomain.com/posts/...` without flickering or redirecting to `storage.googleapis.com`.
 
 * **Use Scenario 1:** if you want absolute control over the data stream, need to prevent caching at all costs, or want to keep your storage buckets entirely hidden from the browser.
 * **Use Scenario 2:** if you are serving large files (video, high-res images, large PDFs) and want to ensure your Go backend doesn't crash or slow down under heavy concurrent traffic.
