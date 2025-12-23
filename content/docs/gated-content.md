@@ -159,24 +159,65 @@ flowchart LR
 1.  **Request Initiation**: The browser requests a protected URL (e.g., `/posts/week0005/`), automatically sending the `__session` cookie.
 2.  **Caddy Routing**: The Caddy proxy forwards the request to the Go Backend's `handleContentGuard` handler on port `:8081`.
 3.  **Authentication Start**: The handler calls `getAuthenticatedUserFromCookie` to identify the requester and their plan.
+    ```
+    user := getAuthenticatedUserFromCookie(r)
+    ```
 4.  **SDK Invocation**: The helper uses the Firebase Admin SDK `authClient` to begin the verification process.
+    ```
+    token, err := authClient.VerifySessionCookie(r.Context(), cookie.Value)
+    ```
 5.  **Token Verification**: The SDK sends the session cookie to the **Auth Emulator (:9099)** to validate the token.
 6.  **UID Retrieval**: The Auth Emulator validates the session and returns the unique User ID (UID) and claims.
 7.  **Database Request**: The helper then uses the **Firestore Admin Client** to look up the user's profile.
+    ```
+    dsnap, err := firestoreClient.Collection("users").Doc(token.UID).Get(r.Context())
+    ```
 8.  **Profile Lookup**: The client queries the **Firestore Emulator (:8080)** using the verified UID.
 9.  **Plan Retrieval**: The Firestore Emulator returns the user's document containing their subscription level (e.g., `pro`).
+    ```
+    data := dsnap.Data()
+    userPlan, _ = data["plan"].(string)
+    ```
 10. **Helper Completion**: The Firestore client returns the retrieved plan data back to the `getAuthenticatedUserFromCookie` function.
 11. **Return User Profile**: The helper returns the full `AuthUser` profile (UID, Email, Plan) back to the `handleContentGuard` handler.
+    ```
+    return &AuthUser{UID: token.UID, Email: token.Claims["email"].(string), Plan: userPlan, ...}
+    ```
 12. **Metadata Fetch**: The handler calls `getRequiredPlans`, which performs an `Attrs` request to the **GCS Emulator (:9000)**.
+    ```
+    requiredPlans, err := getRequiredPlans(r.Context(), objectPath)
+    ```
 13. **Requirements Retrieval**: The GCS Emulator returns the object's custom metadata, specifically the `required-plans` values.
+    ```
+    attrs, err := gcsClient.Bucket(GCSBucket).Object(objectPath).Attrs(ctx)
+    meta := attrs.Metadata["required-plans"]
+    ```
 14. **Authorization Logic**: The handler invokes `isAuthorized` to compare the user's plan level against the object's requirements.
+    ```
+    if !isAuthorized(userPlan, requiredPlans) { ... }
+    ```
 15. **Authorization Outcome**:
     * **15a (Denied)**: If the user fails the check, the handler returns a `403 Forbidden` status and an error page.
+        ```
+        w.WriteHeader(http.StatusForbidden)
+        fmt.Fprintf(w, `<h1>Access Denied</h1>...`)
+        ```
     * **15b (Authorized)**: If the user is authorized, the process continues to content retrieval.
 16. **Media Request**: The handler initiates a standard `http.Get` request with `alt=media` to the **GCS Emulator**.
+    ```
+    emulatorURL := fmt.Sprintf("http://gcs-emulator:9000/storage/v1/b/%s/o/%s?alt=media", GCSBucket, encodedObject)
+    resp, err := http.Get(emulatorURL)
+    ```
 17. **Content Delivery**: The GCS Emulator streams the raw HTML binary data of the post back to the backend.
 18. **Data Reception**: The Go Backend receives the binary data stream and sets the correct `Content-Type` header.
+    ```
+    w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+    w.Header().Set("Cache-Control", "no-store")
+    ```
 19. **Direct Stream to Client**: The backend uses `io.Copy` to pipe the HTML bytes directly to the browser response, completing the proxy flow.
+    ```
+    io.Copy(w, resp.Body)
+    ```
 
 ---
 
@@ -419,124 +460,264 @@ In this model, the user is temporarily redirected (302) to the storage provider 
 
 * * *
 
-## Where Go API gets content/posts/
+## Where Go API gets Content Permissions
 
-If a new post is added, the permissions map is not updated. In order to update the permissions map everytime a new post is added, we need to change the way GitHub Actions builds the Hugo site. For information about building, check [Deploy](../deploy/).
+The Go API identifies content access rules dynamically at runtime by querying the **metadata** of objects stored in Google Cloud Storage (GCS). This ensures that permissions are decoupled from the Go binary and can be updated without redeploying the application.
 
-Go API has to create a permissions map. It has to walk content/posts/. In my development environment, that directory is in frontend/content/posts/. But in production, the directory is in GitHub, right? So, how Go API generate the permissions map? 
+### 1. Metadata-Driven Authorization
+Instead of maintaining a static permissions map, the Go backend performs a real-time check against the specific file being requested.
 
-This is a crucial architecture question that requires you to differentiate between the **build phase** and the **runtime phase** of your application.
+* **Source of Truth**: The GCS Bucket (or GCS Emulator in development) stores both the content bytes and the access requirements.
+* **Metadata Key**: The system specifically looks for a custom metadata attribute named `required-plans` on each GCS object.
+* **Dynamic Resolution**: Access rules are fetched on every request, allowing for immediate updates if a file's permission level is changed in storage.
 
-Since the Go API is responsible for the content guard, it must know the access rules at runtime. Because your source files (`.md` files) are not available to the Go service in production (they are only in your Git repository), you cannot walk the `content/posts/` directory at runtime in the Cloud Run service.
+### 2. Development Environment Workflow
+In development, the Go API interacts with the GCS Emulator to retrieve both object attributes and raw data.
 
-The solution is to **decouple the static content from the runtime configuration** by introducing an intermediate step during your build process.
+1.  **Emulator Connection**: The Go Backend connects to the GCS Emulator (typically port `:9000`) via the `STORAGE_EMULATOR_HOST` configuration.
+2.  **Attribute Retrieval**: When a user requests a path (e.g., `/posts/week0005/`), the backend calls the `getRequiredPlans` helper.
+3.  **API Call**: This helper uses the `gcsClient.Bucket().Object().Attrs()` method to fetch the object's metadata directly from the emulator.
+4.  **Plan Comparison**: The backend extracts the `required-plans` string (e.g., `"pro,elite"`) and compares it against the user's plan level retrieved from Firestore.
 
-Here is the correct workflow for both development and production:
+### 3. Production Workflow
+The production environment maintains strict parity with development, ensuring consistent authorization logic.
 
-### 1\. Development Environment Workflow
+1.  **Stateless Execution**: The Go container in Cloud Run does not require local access to Hugo source files or a pre-compiled JSON permissions map.
+2.  **Centralized Rules**: Because permissions are stored as metadata on the GCS objects themselves, the deployment process simply involves uploading the Hugo-generated HTML files and tagging them with the appropriate `required-plans` metadata.
+3.  **Hierarchy-Based Guard**: The `isAuthorized` function evaluates access based on a defined level hierarchy: `visitor (0) < basic (1) < pro (2) < elite (3)`.
 
-In your development environment, the Go API can read the files directly, which is why your current setup works:
+---
 
-1.  **Go API Startup (`main.go`):** The Go binary runs inside the `backend` container.
-2.  **Mapping Directory:** The `main.go` file defines `ContentRoot = "../frontend/content/posts"`.
-3.  **Local Read:** The Go program is able to traverse its local filesystem, go up one directory, and find the posts directory to read the Markdown front matter (where the access plan is specified).
-4.  **Result:** The Go API builds the in-memory permissions map.
+### Key Implementation Snippets
 
-### 2\. Production (Cloud Run) Workflow
 
-In production, the Go container is isolated. It only contains the compiled Go binary and its dependencies. It does not have access to your Hugo source files.
 
-The Go API must be updated to read the permissions map from a file or a database that is packaged with the container.
-
-#### **Solution: Generate a Configuration File During the Build**
-
-The best practice is to generate a dedicated JSON or TOML configuration file that holds the permissions map and package it with the Go service container.
-
-#### **Step A: Introduce a Build Step (Hugo Build)**
-
-You need a script or a Hugo build step to scan the `content/posts/` directory and extract the access plan from the front matter of every Markdown file.
-
-**Example Script Logic (Conceptual)**:
-
-```bash
-#!/bin/bash
-# Script to run during your CI/CD build before the Go Container is built
-
-# 1. Initialize empty JSON config
-echo '{"permissions": {}}' > permissions.json
-
-# 2. Iterate over all posts
-for file in frontend/content/posts/*.md; do
-  # Extract the path used by the Go API (e.g., /posts/week0001)
-  POST_PATH=$(basename "$file" .md | sed 's/index//') # Generates /posts/week0001
-  
-  # Extract the 'plan' requirement from the front matter (e.g., requires: [basic, pro])
-  REQUIRED_PLANS=$(grep -E '^requires:' "$file" | cut -d '[' -f2 | cut -d ']' -f1 | tr -d ' ')
-  
-  # Append to JSON config
-  # (Actual JSON manipulation is more complex, but this is the concept)
-  # Permissions['/posts/week0001'] = ['basic', 'pro']
-done
-
-# 3. Save permissions.json
-```
-
-#### **Step B: Package the Config File**
-
-In your `backend/Containerfile` (the Dockerfile for your Go API), you must now copy this generated `permissions.json` file into the final image:
-
-```dockerfile
-# backend/Containerfile
-# ... (building and compiling Go binary)
-
-# Stage 2: Final image
-FROM alpine:latest
-# ...
-WORKDIR /app
-COPY --from=builder /path/to/go/binary /app/go-server
-
-# COPY THE GENERATED CONFIG FILE INTO THE IMAGE
-# This file was generated in your CI/CD pipeline and placed here.
-COPY permissions.json /app/permissions.json 
-
-CMD ["/app/go-server", "--config=/app/permissions.json"]
-```
-
-#### **Step C: Update `backend/main.go` (Go Runtime)**
-
-Your Go application will change from walking the local filesystem to loading the config file it finds packaged inside its own container:
+**Metadata Retrieval (`getRequiredPlans`)**
+This function fetches the "Access Control List" directly from the storage provider's metadata for the specific object:
 
 ```go
-// backend/main.go
+func getRequiredPlans(ctx context.Context, objectPath string) ([]string, error) {
+	attrs, err := gcsClient.Bucket(GCSBucket).Object(objectPath).Attrs(ctx)
+	if err != nil {
+		return nil, err
+	}
 
-// CHANGE 1: New path constant for the config file inside the container
-const PermissionsConfigPath = "/app/permissions.json" 
-
-// CHANGE 2: Update the ContentGuard initialization logic
-func main() {
-    // ... setup Firebase/Firestore/GCS clients ...
-
-    if os.Getenv("ENV") == "production" {
-        // PRODUCTION: Load map from the packaged JSON file
-        err := contentGuard.LoadFromFile(PermissionsConfigPath)
-        if err != nil {
-            log.Fatalf("Failed to load permissions config: %v", err)
-        }
-    } else {
-        // DEVELOPMENT: Use old logic to walk local filesystem
-        err := contentGuard.WalkLocalContent(ContentRoot)
-        if err != nil {
-            log.Fatalf("Failed to walk local content: %v", err)
-        }
-    }
-
-    log.Printf("Initializing Content Guard... %d paths loaded.", len(contentGuard.permissions))
-    // ... start server ...
+	meta := attrs.Metadata["required-plans"]
+	if meta == "" {
+		return nil, nil
+	}
+	// ... parses comma-separated string into a slice
 }
-
-// NOTE: You will need to implement the LoadFromFile and WalkLocalContent methods
-// in your ContentGuard struct.
 ```
 
-By decoupling the file discovery (which happens during the CI/CD build) from the permission enforcement (which happens during Cloud Run runtime), you ensure the Go API is always using the correct access rules without needing to access your source code repository.
+**Real-Time Authorization Logic (`isAuthorized`)**
+The backend compares the user's current subscription level against the requirements fetched from GCS:
 
+```go
+func isAuthorized(userPlan string, required []string) bool {
+	if len(required) == 0 {
+		return true // No requirement means public
+	}
+
+	hierarchy := map[string]int{
+		"visitor": 0, "basic": 1, "pro": 2, "elite": 3,
+	}
+
+	userLevel := hierarchy[userPlan]
+	for _, r := range required {
+		if userLevel >= hierarchy[r] {
+			return true
+		}
+	}
+	return false
+}
+```
+
+* * *
+
+## Automatic deployment with GitHub Actions
+
+If you create your posts in your computer with Hugo and push to GitHub, you can use GitHub actions to automate the process of uploading the file to GCS and tagging the file.
+
+To implement this workflow, your GitHub Actions script needs to perform three primary tasks: build the Hugo site, identify the plan requirements from your Markdown files, and upload the resulting HTML to GCS while applying the `required-plans` metadata.
+
+Since your Go Backend is metadata-driven, you don't need to rebuild it; once the file is in GCS with the correct tag, the backend will immediately recognize the new permissions.
+
+### GitHub Actions Workflow
+
+```yaml
+name: Deploy Content to GCS
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'content/posts/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Setup Hugo
+        uses: peaceiris/actions-hugo@v2
+        with:
+          hugo-version: 'latest'
+          extended: true
+
+      - name: Build Hugo Site
+        run: hugo --minify
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Upload and Tag Gated Content
+        run: |
+          # 1. Upload public content (Excluding posts to handle them with metadata)
+          gsutil -m rsync -r -x "posts/.*" public/ gs://${{ secrets.GCS_BUCKET }}/
+
+          # 2. Process and Upload Gated Posts
+          find content/posts -name "*.md" | while read -r md_file; do
+            # Extract folder name (slug)
+            slug=$(basename $(dirname "$md_file"))
+            
+            # Logic for TOML front-matter: categories = ['basic']
+            # We extract the value inside the single quotes
+            plan=$(grep "categories =" "$md_file" | cut -d "'" -f2)
+            
+            # Default to visitor if no category is found
+            if [ -z "$plan" ]; then plan="visitor"; fi
+
+            echo "Deploying $slug with required-plans metadata: $plan"
+
+            # Upload the folder and apply the metadata tag required by main.go
+            gsutil -h "x-goog-meta-required-plans:$plan" cp -r "public/posts/$slug/" "gs://${{ secrets.GCS_BUCKET }}/posts/"
+          done
+```
+
+### How this works
+
+1. **Pathing:** The script preserves the directory structure (`/posts/slug/index.html`). Your backend's `path.Join(GCSBucket, objectPath, "index.html"`) logic will correctly resolve these paths.
+2. **Metadata Identification:** The `gsutil -h "x-goog-meta-required-plans:$plan"` command ensures that when `attrs.Metadata["required-plans"`] is called in Go, it returns the value you defined in your Markdown frontmatter.
+3. **Zero Downtime:** Since your backend uses `getRequiredPlans` at runtime, it fetches the fresh metadata from GCS the moment the `gsutil` command finishes. No restart is required.
+4. **No Backend Change:** Your Go backend remains untouched. It will still call `attrs.Metadata["required-plans"`], which `gsutil` has now populated with the value from your Hugo `categories`.
+5. **Automatic Provisioning:** Every time you push a new post to GitHub, this action builds the HTML and "stamps" the access level directly onto the file in GCS.
+
+### Plan Hierarchy Reference
+
+Your backend will enforce access based on this table:
+
+| Front-matter Source | Metadata Tag Applied (`required-plans`) | Access Logic |
+| :--- | :--- | :--- |
+| `categories = ['visitor']` | `visitor` | Accessible by everyone. |
+| `categories = ['basic']` | `basic` | Basic, Pro, and Elite tiers. |
+| `categories = ['pro']` | `pro` | Pro and Elite tiers. |
+| `categories = ['elite']` | `elite` | Elite tier only. |
+| *(No category found)* | `visitor` | Falls back to public access. |
+
+* * *
+## GCS Upload Guide: Applying Access Metadata
+
+This guide explains how to upload static site content to Google Cloud Storage (GCS) while applying the custom metadata required by the Go Backend's `handleContentGuard` logic.
+
+### 1. The Metadata Schema
+The Go Backend identifies access requirements by querying a custom metadata key. This allows the "Content Guard" to be entirely stateless.
+
+| Plan Level | Metadata Value | Logic Result |
+| :--- | :--- | :--- |
+| **Public** | *(None or Empty)* | Accessible by everyone (including visitors). |
+| **Basic** | `basic` | Accessible by Basic, Pro, and Elite users. |
+| **Pro** | `pro` | Accessible by Pro and Elite users. |
+| **Elite** | `elite` | Accessible by Elite users only. |
+
+
+---
+
+### 2. Uploading via `gsutil` (CLI)
+
+When uploading files via the Google Cloud CLI or shell script, use the `-h` flag to attach the metadata.
+
+**To upload a specific post that requires a "Pro" plan:**
+```bash
+gsutil -h "x-goog-meta-required-plans:pro" cp ./public/posts/week0005/index.html gs://your-bucket-name/posts/week0005/index.html
+```
+
+**To upload an entire directory as "Basic" access:**
+```bash
+gsutil -m -h "x-goog-meta-required-plans:basic" cp -r ./public/posts/ gs://your-bucket-name/posts/
+```
+
+### 3. Automated Deployment (GitHub Actions)
+
+If you use the `google-github-actions/upload-cloud-storage` action, you can define metadata globally or per-file.
+
+```yaml
+- name: 'Upload Gated Content'
+  uses: 'google-github-actions/upload-cloud-storage@v2'
+  with:
+    path: 'public/posts'
+    destination: 'your-bucket-name/posts'
+    # This applies the 'pro' requirement to all files in this upload batch
+    metadata: |-
+      {
+        "required-plans": "pro"
+      }
+```
+
+### 4. Local Development (Go Uploader Script)
+
+In your local environment, you may have a Go script to seed the **GCS Emulator**. Ensure it uses the `storage.Writer` to set the metadata map:
+
+```go
+// Example snippet for a local uploader
+func uploadFile(ctx context.Context, client *storage.Client, bucket, object, plan string) error {
+    wc := client.Bucket(bucket).Object(object).NewWriter(ctx)
+    
+    // This maps exactly to what getRequiredPlans() looks for in main.go
+    wc.Metadata = map[string]string{
+        "required-plans": plan, 
+    }
+    
+    // ... copy file content to wc ...
+    return wc.Close()
+}
+```
+
+### 5. Verifying Metadata in the Emulator
+
+To verify that your metadata was applied correctly in the local development environment, you can query the GCS Emulator's REST API directly in your browser or via `curl`:
+Bash
+
+```BASH
+curl http://localhost:9000/storage/v1/b/content/o/posts%2Fweek0005%2Findex.html
+```
+
+**Look for the metadata object in the JSON response:**
+
+```json
+{
+  "name": "posts/week0005/index.html",
+  "bucket": "content",
+  "metadata": {
+    "required-plans": "pro"
+  }
+}
+```
+
+### 6. Summary of Flow
+
+1. **Hugo Build:** Generates static HTML in `/public`.
+2. **Upload:** Files are moved to GCS; metadata is attached based on the post's category.
+3. **Request:** User visits the site; Go Backend fetches metadata via `Attrs()`.
+4. **Enforcement:** `isAuthorized()` compares User Plan vs. Metadata Plan.
+5. **Stream:** Content is served only if levels match.
+
+* * *
