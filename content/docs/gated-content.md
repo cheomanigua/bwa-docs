@@ -103,14 +103,14 @@ flowchart LR
         caddy_route([Route: /posts/*])
     end
 
-    subgraph Go_Backend ["backend:8081"]
+    subgraph Go_Backend ["backend:8081 (App Struct)"]
         direction TB
         handler(handleContentGuard)
         helper(getAuthenticatedUserFromCookie)
         guard(isAuthorized)
         http_fetch(Standard http.Get)
-        auth_admin(Firebase Admin SDK<br/>Auth Client)
-        firestore_client(Firestore Admin Client)
+        auth_admin(Firebase Auth Client)
+        firestore_client(Firestore Client)
     end
 
     subgraph Firebase_Emulators
@@ -121,7 +121,7 @@ flowchart LR
 
     subgraph GCS_Emulator ["gcs-emulator:9000"]
         direction TB
-        gcs_api([GCS REST API])
+        gcs_api([GCS API /storage/v1/])
     end
 
     request -- 1 --> caddy_route
@@ -152,72 +152,82 @@ flowchart LR
     gcs_api -- 17 --> http_fetch
     http_fetch -- 18 --> handler
     handler -- 19 --> display
+
 ```
 
 #### 4. Process Steps
 
-1.  **Request Initiation**: The browser requests a protected URL (e.g., `/posts/week0005/`), automatically sending the `__session` cookie.
-2.  **Caddy Routing**: The Caddy proxy forwards the request to the Go Backend's `handleContentGuard` handler on port `:8081`.
-3.  **Authentication Start**: The handler calls `getAuthenticatedUserFromCookie` to identify the requester and their plan.
-    ```
-    user := getAuthenticatedUserFromCookie(r)
-    ```
-4.  **SDK Invocation**: The helper uses the Firebase Admin SDK `authClient` to begin the verification process.
-    ```
-    token, err := authClient.VerifySessionCookie(r.Context(), cookie.Value)
-    ```
-5.  **Token Verification**: The SDK sends the session cookie to the **Auth Emulator (:9099)** to validate the token.
-6.  **UID Retrieval**: The Auth Emulator validates the session and returns the unique User ID (UID) and claims.
-7.  **Database Request**: The helper then uses the **Firestore Admin Client** to look up the user's profile.
-    ```
-    dsnap, err := firestoreClient.Collection("users").Doc(token.UID).Get(r.Context())
-    ```
-8.  **Profile Lookup**: The client queries the **Firestore Emulator (:8080)** using the verified UID.
-9.  **Plan Retrieval**: The Firestore Emulator returns the user's document containing their subscription level (e.g., `pro`).
-    ```
-    data := dsnap.Data()
-    userPlan, _ = data["plan"].(string)
-    ```
-10. **Helper Completion**: The Firestore client returns the retrieved plan data back to the `getAuthenticatedUserFromCookie` function.
-11. **Return User Profile**: The helper returns the full `AuthUser` profile (UID, Email, Plan) back to the `handleContentGuard` handler.
-    ```
-    return &AuthUser{UID: token.UID, Email: token.Claims["email"].(string), Plan: userPlan, ...}
-    ```
-12. **Metadata Fetch**: The handler calls `getRequiredPlans`, which performs an `Attrs` request to the **GCS Emulator (:9000)**.
-    ```
-    requiredPlans, err := getRequiredPlans(r.Context(), objectPath)
-    ```
-13. **Requirements Retrieval**: The GCS Emulator returns the object's custom metadata, specifically the `required-plans` values.
-    ```
-    attrs, err := gcsClient.Bucket(GCSBucket).Object(objectPath).Attrs(ctx)
-    meta := attrs.Metadata["required-plans"]
-    ```
-14. **Authorization Logic**: The handler invokes `isAuthorized` to compare the user's plan level against the object's requirements.
-    ```
-    if !isAuthorized(userPlan, requiredPlans) { ... }
-    ```
+1. **Request Initiation**: The browser requests a protected URL, automatically sending the `__session` cookie.
+2. **Caddy Routing**: Caddy forwards the request to the backend.
+3. **Authentication Start**: The handler resolves the identity of the requester.
+```
+user := a.getAuthenticatedUserFromCookie(r)
+
+```
+4. **SDK Invocation**: The helper calls the Firebase SDK to verify the cookie.
+```
+token, err := a.auth.VerifySessionCookie(r.Context(), cookie.Value)
+
+```
+5. **Token Verification**: The SDK sends the cookie to the **Auth Emulator (:9099)**.
+6. **UID Retrieval**: The Auth Emulator returns the verified UID and claims.
+7. **Database Request**: The helper initiates a Firestore lookup.
+```
+dsnap, err := a.firestore.Collection("users").Doc(token.UID).Get(r.Context())
+
+```
+8. **Profile Lookup**: The client queries the **Firestore Emulator (:8080)**.
+9. **Plan Retrieval**: The Firestore Emulator returns the document data.
+```
+userPlan, _ = data["plan"].(string)
+
+```
+10. **Client Return**: Plan data is passed back to the `getAuthenticatedUserFromCookie` helper.
+11. **Return User Profile**: The helper returns the full `AuthUser` struct.
+```
+return &AuthUser{UID: token.UID, Email: token.Claims["email"].(string), Plan: userPlan, ...}
+
+```
+12. **Metadata Fetch**: The handler requests attributes from the **GCS Emulator (:9000)**.
+```
+attrs, err := a.storage.Bucket(a.bucket).Object(objectPath).Attrs(ctx)
+
+```
+13. **Requirements Retrieval**: The GCS Emulator returns the object's custom metadata.
+```
+meta := attrs.Metadata["required-plans"]
+
+```
+14. **Authorization Logic**: The handler compares the user's plan level against the requirements.
+```
+if !isAuthorized(userPlan, required) { ... }
+
+```
 15. **Authorization Outcome**:
-    * **15a (Denied)**: If the user fails the check, the handler returns a `403 Forbidden` status and an error page.
-        ```
-        w.WriteHeader(http.StatusForbidden)
-        fmt.Fprintf(w, `<h1>Access Denied</h1>...`)
-        ```
-    * **15b (Authorized)**: If the user is authorized, the process continues to content retrieval.
-16. **Media Request**: The handler initiates a standard `http.Get` request with `alt=media` to the **GCS Emulator**.
+* **15a (Denied)**: Returns `403 Forbidden`.
     ```
-    emulatorURL := fmt.Sprintf("http://gcs-emulator:9000/storage/v1/b/%s/o/%s?alt=media", GCSBucket, encodedObject)
-    resp, err := http.Get(emulatorURL)
+    w.WriteHeader(http.StatusForbidden)
+    fmt.Fprintf(w, "<html><body><h1>Access Denied</h1>...")
+
     ```
-17. **Content Delivery**: The GCS Emulator streams the raw HTML binary data of the post back to the backend.
-18. **Data Reception**: The Go Backend receives the binary data stream and sets the correct `Content-Type` header.
-    ```
-    w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
-    w.Header().Set("Cache-Control", "no-store")
-    ```
-19. **Direct Stream to Client**: The backend uses `io.Copy` to pipe the HTML bytes directly to the browser response, completing the proxy flow.
-    ```
-    io.Copy(w, resp.Body)
-    ```
+* **15b (Authorized)**: Continues to content retrieval.
+
+16. **Media Request**: The backend initiates an `http.Get` request with `alt=media`.
+```
+resp, err := http.Get(emulatorURL)
+
+```
+17. **Content Delivery**: The GCS Emulator streams raw binary data back to the backend.
+18. **Data Reception**: The backend sets the headers for the incoming stream.
+```
+w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+w.Header().Set("Cache-Control", "no-store")
+
+```
+19. **Direct Stream to Client**: The backend pipes the data directly to the user's browser.
+```
+io.Copy(w, resp.Body)
+```
 
 ---
 
@@ -492,22 +502,24 @@ The production environment maintains strict parity with development, ensuring co
 
 
 
-**Metadata Retrieval (`getRequiredPlans`)**
-This function fetches the "Access Control List" directly from the storage provider's metadata for the specific object:
+**Metadata Retrieval (`handleContentGuard`)**
+This snippet fetches the "Access Control List" directly from the storage provider's metadata for the specific object:
 
 ```go
-func getRequiredPlans(ctx context.Context, objectPath string) ([]string, error) {
-	attrs, err := gcsClient.Bucket(GCSBucket).Object(objectPath).Attrs(ctx)
+	attrs, err := a.storage.Bucket(a.bucket).Object(objectPath).Attrs(ctx)
 	if err != nil {
-		return nil, err
+		log.Printf("GCS Metadata error for %s: %v", objectPath, err)
+		http.Error(w, "Content not found", http.StatusNotFound)
+		return
 	}
 
 	meta := attrs.Metadata["required-plans"]
-	if meta == "" {
-		return nil, nil
+	var required []string
+	if meta != "" {
+		for p := range strings.SplitSeq(meta, ",") {
+			required = append(required, strings.TrimSpace(p))
+		}
 	}
-	// ... parses comma-separated string into a slice
-}
 ```
 
 **Real-Time Authorization Logic (`isAuthorized`)**
@@ -516,20 +528,22 @@ The backend compares the user's current subscription level against the requireme
 ```go
 func isAuthorized(userPlan string, required []string) bool {
 	if len(required) == 0 {
-		return true // No requirement means public
+		return true
 	}
-
-	hierarchy := map[string]int{
-		"visitor": 0, "basic": 1, "pro": 2, "elite": 3,
-	}
-
-	userLevel := hierarchy[userPlan]
+	hierarchy := map[string]int{"visitor": 0, "basic": 1, "pro": 2, "elite": 3}
 	for _, r := range required {
-		if userLevel >= hierarchy[r] {
+		if hierarchy[userPlan] >= hierarchy[r] {
 			return true
 		}
 	}
 	return false
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 ```
 

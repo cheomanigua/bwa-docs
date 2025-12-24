@@ -65,7 +65,7 @@ Your webhook signing secret is whsec_longalphanumericstring (^C to quit)
 > [!WARNING]
 > Keep the bridge open, don't stop it with **Ctrl** + **C**. Open a new terminal to run your containers.
 
-You must use the new `whsec_` secret it outputs to set the `StripeWebhookSecret` in your local Go environment before running your server. This is necessary for the integrity check performed by `webhook.ConstructEventWithOptions(...)` in `main.go`:
+You must use the `whsec_` secret it outputs to set the `StripeWebhookSecret` in your local Go environment before running your server. This is necessary for the integrity check performed by `webhook.ConstructEventWithOptions(...)` in `main.go`:
 ```go
 StripeWebhookSecret = getEnv("STRIPE_WEBHOOK_SECRET", "whsec_...")
 

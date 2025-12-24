@@ -327,211 +327,41 @@ CMD ["/usr/bin/caddy", "run", "--config", "/etc/caddy/Caddyfile"]
 
 ## Dev vs Prod
 
+| Area                        | Firebase Emulator (localhost)                                                                  | Production Firebase + GCP                                           | What breaks / changes in prod                                                |
+|-----------------------------|------------------------------------------------------------------------------------------------|---------------------------------------------------------------------|----------------------------------------------------------------------------|
+| Authentication              | FIREBASE_AUTH_EMULATOR_HOST="localhost:9099" → unlimited users, no email verification, no rate limits | Real users, email verification, password policies, reCAPTCHA, blocked abusive IPs, rate limits | Email verification required, sign-in can be blocked                        |
+| Firestore Data              | Data lives only in RAM or local files → disappears on shutdown/restart                         | Data is permanent, global, eventually consistent, billed per read/write/delete | You pay for every operation, data survives forever                        |
+| Firestore Security Rules    | Completely ignored unless you explicitly run firebase emulators:start --only firestore,auth with rules | Enforced on every read/write → will reject requests even if your Go Admin SDK bypasses them for client SDKs | Your frontend will 403 if rules are wrong                                 |
+| Firebase Admin SDK          | Works normally (you use option.WithoutAuthentication() or service account)                     | In Cloud Run you must use Application Default Credentials or service account key | No WithoutAuthentication() in prod                                          |
+| Stripe Webhooks             | You cannot hit localhost from Stripe → you need ngrok/tunnel or stripe listen --forward-to localhost:8081 | Stripe hits your real Cloud Run URL directly                          | Webhook endpoint must be public + HTTPS                                    |
+| Cloud Run URLs              | http://localhost:8081                                                                            | https://your-service-abc123-uc.a.run.app                             | CORS, HTTPS, IAP if private                                                |
+| Billing & Quotas            | Unlimited everything for free                                                                   | Hard quotas + costs: reads, writes, storage, Auth users, Hosting bandwidth, etc. | You will hit limits and get billed                                          |
+| Latency & Consistency       | Instant (<5 ms)                                                                                 | 50–400 ms depending on region + eventual consistency                | Slower, occasional stale reads                                             |
+| Functions Triggers          | functions, firestore, auth triggers work locally                                                 | Real Cloud Functions or Cloud Run triggered by events               | Different URLs, cold starts                                                |
+| Hosting + Custom Domains    | Only serves on localhost:5000                                                                   | Real custom domain + SSL + CDN                                      | Real SEO, real performance                                                 |
+| Identity Platform Features  | Not emulated (phone auth, SAML, OIDC, blocking functions)                                       | Available in prod (extra cost)                                      | Features missing locally                                                   |
+| Service Account Permissions | You can use any service account JSON                                                            | In GCP the Cloud Run service account must have exact roles (Firestore, Auth Admin, etc.) | IAM errors if roles missing                                               |
+| Logging & Monitoring        | firebase emulators:start prints to console                                                      | Cloud Logging, Error Reporting, Tracing                             | Different debugging experience                                             |
 
-Area
-
-Firebase Emulator (localhost)
-
-Production Firebase + GCP
-
-What breaks / changes in prod
-
-1
-
-Authentication
-
-`FIREBASE_AUTH_EMULATOR_HOST="localhost:9099"` → unlimited users, no email verification, no rate limits
-
-Real users, email verification, password policies, reCAPTCHA, blocked abusive IPs, rate limits
-
-Email verification required, sign-in can be blocked
-
-2
-
-Firestore Data
-
-Data lives only in RAM or local files → disappears on shutdown/restart
-
-Data is permanent, global, eventually consistent, billed per read/write/delete
-
-You pay for every operation, data survives forever
-
-3
-
-Firestore Security Rules
-
-**Completely ignored** unless you explicitly run `firebase emulators:start --only firestore,auth` with rules
-
-Enforced on every read/write → will reject requests even if your Go Admin SDK bypasses them for client SDKs
-
-Your frontend will 403 if rules are wrong
-
-4
-
-Firebase Admin SDK
-
-Works normally (you use `option.WithoutAuthentication()` or service account)
-
-In Cloud Run you **must** use Application Default Credentials or service account key
-
-No `WithoutAuthentication()` in prod
-
-5
-
-Stripe Webhooks
-
-You cannot hit `localhost` from Stripe → you need ngrok/tunnel or `stripe listen --forward-to localhost:8081`
-
-Stripe hits your real Cloud Run URL directly
-
-Webhook endpoint must be public + HTTPS
-
-6
-
-Cloud Run URLs
-
-`http://localhost:8081`
-
-`https://your-service-abc123-uc.a.run.app`
-
-CORS, HTTPS, IAP if private
-
-7
-
-Billing & Quotas
-
-Unlimited everything for free
-
-Hard quotas + costs: reads, writes, storage, Auth users, Hosting bandwidth, etc.
-
-You will hit limits and get billed
-
-8
-
-Latency & Consistency
-
-Instant (<5 ms)
-
-50–400 ms depending on region + eventual consistency
-
-Slower, occasional stale reads
-
-9
-
-Functions Triggers
-
-`functions`, `firestore`, `auth` triggers work locally
-
-Real Cloud Functions or Cloud Run triggered by events
-
-Different URLs, cold starts
-
-10
-
-Hosting + Custom Domains
-
-Only serves on `localhost:5000`
-
-Real custom domain + SSL + CDN
-
-Real SEO, real performance
-
-11
-
-Identity Platform Features
-
-Not emulated (phone auth, SAML, OIDC, blocking functions)
-
-Available in prod (extra cost)
-
-Features missing locally
-
-12
-
-Service Account Permissions
-
-You can use any service account JSON
-
-In GCP the Cloud Run service account must have exact roles (Firestore, Auth Admin, etc.)
-
-IAM errors if roles missing
-
-13
-
-Logging & Monitoring
-
-`firebase emulators:start` prints to console
-
-Cloud Logging, Error Reporting, Tracing
-
-Different debugging experience
 
 ### Quick checklist: “Will it work the same in production?”
 
-Feature
-
-Works identically?
-
-Notes
-
-`authClient.VerifyIDToken()`
-
-Yes
-
-Same code
-
-`firestoreClient.Get/Set` with Admin SDK
-
-Yes
-
-Same code
-
-Registration flow (your Go API)
-
-Yes
-
-Same code
-
-Stripe Checkout Session creation
-
-Yes
-
-Same code
-
-Stripe webhooks
-
-No
-
-Must use real endpoint or CLI forwarding
-
-Firestore Security Rules
-
-No
-
-Ignored locally
-
-Email verification / password reset
-
-No
-
-Not emulated
-
-Rate limiting / abuse protection
-
-No
-
-No limits locally
-
-Costs
-
-No
-
-$0 vs real money
+| Feature                               | Works identically? | Notes                                                   |
+|---------------------------------------|--------------------|---------------------------------------------------------|
+| authClient.VerifyIDToken()            | Yes                | Same code                                               |
+| firestoreClient.Get/Set with Admin SDK| Yes                | Same code                                               |
+| Registration flow (your Go API)      | Yes                | Same code                                               |
+| Stripe Checkout Session creation     | Yes                | Same code                                               |
+| Stripe webhooks                       | No                 | Must use real endpoint or CLI forwarding                |
+| Firestore Security Rules             | No                 | Ignored locally                                         |
+| Email verification / password reset  | No                 | Not emulated                                            |
+| Rate limiting / abuse protection     | No                 | No limits locally                                       |
+| Costs                                 | No                 | $0 vs real money                                        |
 
 ### Bottom line you feel every day
 
-| Local emulator → great for 95 % of development (fast, free, offline)
-| Production → you suddenly pay, hit quotas, deal with webhooks, security rules, IAM, and real users
+- Local emulator → great for 95 % of development (fast, free, offline)
+- Production → you suddenly pay, hit quotas, deal with webhooks, security rules, IAM, and real users
 
 Keep developing 100 % against the emulator, but **always do a final test on a real staging project** before releasing — especially Stripe webhooks, security rules, and IAM are the three things that most commonly break when you go live.
 
@@ -539,101 +369,20 @@ Keep developing 100 % against the emulator, but **always do a final test on a re
 
 Here’s the **exact list of Firebase-related files/configs** that behave differently or can bite you when you switch from **emulators** to **real production** — and what you must check/adapt in each one.
 
-File / Config
+| File / Config                      | What it contains                                                           | Emulator vs Production difference                                                 | What you MUST change or double-check before going live                                           |
+|------------------------------------|---------------------------------------------------------------------------|-----------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------|
+| firebase.json                      | Hosting config, rewrites, emulator ports, functions triggers               | In dev you often have rewrites to localhost or emulator ports                     | Remove or comment out any rewrites that point to localhost or emulator ports                   |
+| .firebaserc                        | Mapping of local aliases → real Firebase project IDs (default, staging, prod) | firebase use dev → points to your emulator project; firebase use prod → real project | Make sure firebase use prod (or --project your-prod-id) is active before deploy                |
+| firestore.rules                    | Security rules                                                            | Completely ignored by emulator unless you start it with --only firestore; always enforced in prod | Test them locally with firebase emulators:start --only firestore + real client SDK (not Admin SDK) |
+| firestore.indexes.json             | Composite indexes                                                         | Works the same, but you forget to deploy them → queries fail in prod              | Always run firebase deploy --only firestore:indexes after adding new ones                      |
+| storage.rules                      | Storage security rules (if you use Firebase Storage)                       | Same story as Firestore rules — ignored locally unless emulated                   | Deploy + test with real client SDK                                                           |
+| functions/.env or functions/.runtimeconfig | Environment variables for Cloud Functions (if you have any)              | Often contain STRIPE_SECRET_KEY=test_..., IS_EMULATOR=true, etc.                   | Switch to live Stripe keys, remove emulator flags                                             |
+| src/firebaseConfig.ts or src/firebase.js (web) | firebase.initializeApp({ apiKey, authDomain, projectId, ... })            | Dev version usually points to localhost or dev project (projectId: "demo-dev")    | Change projectId, authDomain, apiKey to production values                                     |
+| Service account JSON (for Go backend) | google-credentials.json or ADC in Cloud Run                               | In dev you often use option.WithCredentialsFile("dev-service-account.json") or WithoutAuthentication() | In production Cloud Run → delete WithoutAuthentication() and rely on ADC (default service account) |
+| Go environment variables           | FIREBASE_AUTH_EMULATOR_HOST, FIRESTORE_EMULATOR_HOST                       | Set in dev → must be absent in production                                          | Remove these two env vars completely in prod                                                  |
+| stripe webhook secret              | Hard-coded or in .env                                                     | Dev: test webhook secret whsec_test_...; Prod: live secret whsec_...               | Use different secrets per environment                                                        |
+| functions/index.js or Cloud Run code | Any process.env.IS_EMULATOR checks                                         | Often used to skip email verification, etc.                                        | Remove or guard those blocks for production                                                  |
 
-What it contains
-
-Emulator vs Production difference
-
-What you MUST change or double-check before going live
-
-`firebase.json`
-
-Hosting config, rewrites, emulator ports, functions triggers
-
-In dev you often have `rewrites` to localhost or emulator ports
-
-Remove or comment out any `rewrites` that point to `localhost` or emulator ports
-
-`.firebaserc`
-
-Mapping of local aliases → real Firebase project IDs (`default`, `staging`, `prod`)
-
-`firebase use dev` → points to your emulator project; `firebase use prod` → real project
-
-Make sure `firebase use prod` (or `--project your-prod-id`) is active before deploy
-
-`firestore.rules`
-
-Security rules
-
-Completely ignored by emulator unless you start it with `--only firestore`; always enforced in prod
-
-Test them locally with `firebase emulators:start --only firestore` + real client SDK (not Admin SDK)
-
-`firestore.indexes.json`
-
-Composite indexes
-
-Works the same, but you forget to deploy them → queries fail in prod
-
-Always run `firebase deploy --only firestore:indexes` after adding new ones
-
-`storage.rules`
-
-Storage security rules (if you use Firebase Storage)
-
-Same story as Firestore rules — ignored locally unless emulated
-
-Deploy + test with real client SDK
-
-`functions/.env` or `functions/.runtimeconfig`
-
-Environment variables for Cloud Functions (if you have any)
-
-Often contain `STRIPE_SECRET_KEY=test_...`, `IS_EMULATOR=true`, etc.
-
-Switch to live Stripe keys, remove emulator flags
-
-`src/firebaseConfig.ts` or `src/firebase.js` (web)
-
-`firebase.initializeApp({ apiKey, authDomain, projectId, ... })`
-
-Dev version usually points to `localhost` or dev project (`projectId: "demo-dev"`)
-
-Change `projectId`, `authDomain`, `apiKey` to production values
-
-Service account JSON (for Go backend)
-
-`google-credentials.json` or ADC in Cloud Run
-
-In dev you often use `option.WithCredentialsFile("dev-service-account.json")` or `WithoutAuthentication()`
-
-In production Cloud Run → **delete** `WithoutAuthentication()` and rely on ADC (default service account)
-
-Go environment variables
-
-`FIREBASE_AUTH_EMULATOR_HOST`, `FIRESTORE_EMULATOR_HOST`
-
-Set in dev → must be **absent** in production
-
-Remove these two env vars completely in prod
-
-`stripe webhook secret`
-
-Hard-coded or in `.env`
-
-Dev: test webhook secret `whsec_test_...`; Prod: live secret `whsec_...`
-
-Use different secrets per environment
-
-`functions/index.js` or Cloud Run code
-
-Any `process.env.IS_EMULATOR` checks
-
-Often used to skip email verification, etc.
-
-Remove or guard those blocks for production
 
 ### Minimal checklist you run before every production deploy
 
