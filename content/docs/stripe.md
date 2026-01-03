@@ -1106,11 +1106,11 @@ You will get something like this:
 2025/12/16 13:34:14 Starting Go server on :8081
 2025/12/16 13:35:35 Checkout session completed for Email: juan@mail.com, Plan: elite, Customer ID: cus_TcCpZkxD0hFQdr
 2025/12/16 13:35:35 Created new Firebase user with UID: XueVUBP6KfWp18UupZc2wS5BLSQY
-2025/12/16 13:35:36 SIMULATING SENDGRID: To johndoe@mail.com, Setup Link: http://localhost:9099/emulator/action?mode=resetPassword&lang=en&oobCode=lezz8pW7350dqq67PT-XZAKuMikvF6HfCEp7jXu8WM5TAxeZfwbYkr&apiKey=fake-api-key
+2025/12/16 13:35:36 SIMULATING SENDGRID: To johndoe@mail.com, Setup Link: http://127.0.0.1:9099/emulator/action?mode=resetPassword&lang=en&oobCode=lezz8pW7350dqq67PT-XZAKuMikvF6HfCEp7jXu8WM5TAxeZfwbYkr&apiKey=fake-api-key
 ```
 The last logs line is what we are looking for. Now run these command:
 ```
-curl "http://localhost:9099/emulator/action?mode=resetPassword&lang=en&oobCode=lezz8pW7350dqq67PT-XZAKuMikvF6HfCEp7jXu8WM5TAxeZfwbYkr&apiKey=fake-api-key&newPassword=fakepassword"
+curl "http://127.0.0.1:9099/emulator/action?mode=resetPassword&lang=en&oobCode=lezz8pW7350dqq67PT-XZAKuMikvF6HfCEp7jXu8WM5TAxeZfwbYkr&apiKey=fake-api-key&newPassword=fakepassword"
 ```
 If everything goes well, you'll get:
 ```
